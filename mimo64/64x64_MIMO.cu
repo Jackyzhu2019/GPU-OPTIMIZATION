@@ -242,230 +242,112 @@ void mimo64_naive_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMa
 	return;
 }
 
-#define BLOCK_SIZE_ROW 8
-#define BLOCK_SIZE_COL 4
-#define BLOCK_SIZE_K 8
-
-void mimo64_block_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMatrix)
+__global__ void mimo64_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
 {
-	int numOfloop = nElem / nElemPerMatrix;
+	int numOfloop = nElem / 4;
 	int loopIdx;
 	int iRow, iCol, iK;
 	float *G0, *Y0, *X0;
-	int i, j, k, t;
 	
-	for (loopIdx = 0; loopIdx < numOfloop; loopIdx++)
+	int M = 64;
+	int K = 64;
+	int N = 4;
+	int nElemPerMatrix = 4;
+	
+	// inside a block
+	int xIdx = threadIdx.x; 
+	int yIdx = threadIdx.y;
+	// block shape
+	int xLen = blockDim.x;
+	int yLen = blockDim.y;
+	// block index
+	int Block_X_Idx = blockIdx.x;
+	int Block_Y_Idx = blockIdx.y; // 0
+	
+	int tid_x = Block_X_Idx * xLen + xIdx;
+	int tid_y = Block_Y_Idx * yLen + yIdx;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * nElemPerMatrix * Block_X_Idx;
+	X0 = X + 64 * nElemPerMatrix * Block_X_Idx;
+	
+	iRow = yIdx;
+	iCol = xIdx;
+	//for (iRow = 0; iRow < 64; iRow++)
 	{
-		G0 = G + 64 * 64 * loopIdx;
-		Y0 = Y + 64 * nElemPerMatrix * loopIdx;
-		X0 = X + 64 * nElemPerMatrix * loopIdx;
-		
-		// G matrix (64 x 64) x Y matrix (64 x nElemPerMatrix(4))
-		for (iRow = 0; iRow < 64; iRow += BLOCK_SIZE_ROW)
+		//for (iCol = 0; iCol < nElemPerMatrix; iCol++)
 		{
-			for (iCol = 0; iCol < nElemPerMatrix; iCol += BLOCK_SIZE_COL)
+			float accuVal = 0.0f;
+			
+			for (iK = 0; iK < 64; iK++)
 			{
-				float accuVal[BLOCK_SIZE_ROW][BLOCK_SIZE_COL];
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						accuVal[i][j] = 0.0f;
-					}
-				}
 				
-				
-				for (iK = 0; iK < 64; iK += BLOCK_SIZE_K)
-				{
-					
-					for (i = 0; i < BLOCK_SIZE_ROW; i++)
-					{	
-						for (j = 0; j < BLOCK_SIZE_COL; j++)
-						{	
-							for (k = 0; k < BLOCK_SIZE_K; k++){
-								accuVal[i][j] += G0[(iRow + i) * 64 + iK + k] * Y0[(iK + k) * nElemPerMatrix + iCol + j];		
-							}
-						}
-					}
-				}
-				
-				
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						X0[(iRow + i) * nElemPerMatrix + iCol + j] = accuVal[i][j];
-					}
-				}		
+				accuVal += G0[iRow * 64 + iK] * Y0[iK * nElemPerMatrix + iCol];
+			
 			}
+			
+			X0[iRow * nElemPerMatrix + iCol] = accuVal;
 		}
 	}
-
+	
 
 	return;
 }
 
 
-void mimo64_cache_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMatrix)
+__global__ void mimo64_revised_gpu_kernel(float *G, float *Y, float *X, int nElem)
 {
-	int numOfloop = nElem / nElemPerMatrix;
+	int numOfloop = nElem / 4;
 	int loopIdx;
 	int iRow, iCol, iK;
 	float *G0, *Y0, *X0;
-	int i, j, k, t;
-	float G_cache[64][64];
-	float Y_cache[4][64];
 	
-	for (loopIdx = 0; loopIdx < numOfloop; loopIdx++)
+	int M = 64;
+	int K = 64;
+	int N = 4;
+	int nElemPerMatrix = 4;
+	
+	// inside a block
+	int xIdx = threadIdx.x; 
+	int yIdx = threadIdx.y;
+	// block shape
+	int xLen = blockDim.x;
+	int yLen = blockDim.y;
+	// block index
+	int Block_X_Idx = blockIdx.x;
+	int Block_Y_Idx = blockIdx.y; // 0
+	
+	int tid_x = Block_X_Idx * xLen + xIdx;
+	int tid_y = Block_Y_Idx * yLen + yIdx;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * nElemPerMatrix * Block_X_Idx;
+	X0 = X + 64 * nElemPerMatrix * Block_X_Idx;
+	
+	iRow = yIdx;
+	iCol = xIdx;
+	//for (iRow = 0; iRow < 64; iRow++)
 	{
-		G0 = G + 64 * 64 * loopIdx;
-		Y0 = Y + 64 * nElemPerMatrix * loopIdx;
-		X0 = X + 64 * nElemPerMatrix * loopIdx;
-		
-		
-		// prefetch the data to L1 cahce
-		for (int i = 0; i < 64; i++)
+		//for (iCol = 0; iCol < nElemPerMatrix; iCol++)
 		{
-			for (int j = 0; j < 64; j++)
+			float accuVal = 0.0f;
+			
+			for (iK = 0; iK < 64; iK++)
 			{
-				G_cache[i][j] = *G0++;
-			}			
-		}
-		
-		for (int i = 0; i < 4; i++)
-		{
-			for (int j = 0; j < 64; j++)
-			{
-				// transpose
-				Y_cache[i][j] = Y0[j * nElemPerMatrix + i];
-			}			
-		}
-		
-		// G matrix (64 x 64) x Y matrix (64 x nElemPerMatrix(4))
-		for (iRow = 0; iRow < 64; iRow += BLOCK_SIZE_ROW)
-		{
-			for (iCol = 0; iCol < nElemPerMatrix; iCol += BLOCK_SIZE_COL)
-			{
-				float accuVal[BLOCK_SIZE_ROW][BLOCK_SIZE_COL];
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						accuVal[i][j] = 0.0f;
-					}
-				}
 				
-				
-				for (iK = 0; iK < 64; iK += BLOCK_SIZE_K)
-				{
-					
-					for (i = 0; i < BLOCK_SIZE_ROW; i++)
-					{	
-						for (j = 0; j < BLOCK_SIZE_COL; j++)
-						{	
-							for (k = 0; k < BLOCK_SIZE_K; k++){
-								accuVal[i][j] += G_cache[iRow + i][iK + k] * Y_cache[iCol + j][iK + k];		
-							}
-						}
-					}
-				}
-				
-				
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						X0[(iRow + i) * nElemPerMatrix + iCol + j] = accuVal[i][j];
-					}
-				}		
+				accuVal += G0[iRow * 64 + iK] * Y0[iK * nElemPerMatrix + iCol];
+			
 			}
+			
+			X0[iRow * nElemPerMatrix + iCol] = accuVal;
 		}
 	}
-
+	
 
 	return;
 }
 
 
-void mimo64_neon_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMatrix)
-{
-	int numOfloop = nElem / nElemPerMatrix;
-	int loopIdx;
-	int iRow, iCol, iK;
-	float *G0, *Y0, *X0;
-	int i, j, k, t;
-	float G_cache[64][64];
-	float Y_cache[4][64];
-	
-	for (loopIdx = 0; loopIdx < numOfloop; loopIdx++)
-	{
-		G0 = G + 64 * 64 * loopIdx;
-		Y0 = Y + 64 * nElemPerMatrix * loopIdx;
-		X0 = X + 64 * nElemPerMatrix * loopIdx;
-		
-		
-		// prefetch the data to L1 cahce
-		for (int i = 0; i < 64; i++)
-		{
-			for (int j = 0; j < 64; j++)
-			{
-				G_cache[i][j] = *G0++;
-			}			
-		}
-		
-		for (int i = 0; i < 4; i++)
-		{
-			for (int j = 0; j < 64; j++)
-			{
-				// transpose
-				Y_cache[i][j] = Y0[j * nElemPerMatrix + i];
-			}			
-		}
-		
-		// G matrix (64 x 64) x Y matrix (64 x nElemPerMatrix(4))
-		for (iRow = 0; iRow < 64; iRow += BLOCK_SIZE_ROW)
-		{
-			for (iCol = 0; iCol < nElemPerMatrix; iCol += BLOCK_SIZE_COL)
-			{
-				float accuVal[BLOCK_SIZE_ROW][BLOCK_SIZE_COL];
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						accuVal[i][j] = 0.0f;
-					}
-				}
-				
-				
-				for (iK = 0; iK < 64; iK += BLOCK_SIZE_K)
-				{
-					
-					for (i = 0; i < BLOCK_SIZE_ROW; i++)
-					{	
-						for (j = 0; j < BLOCK_SIZE_COL; j++)
-						{	
-							for (k = 0; k < BLOCK_SIZE_K; k++){
-								accuVal[i][j] += G_cache[iRow + i][iK + k] * Y_cache[iCol + j][iK + k];		
-							}
-						}
-					}
-				}
-				
-				
-				for (i = 0; i < BLOCK_SIZE_ROW; i++)
-				{
-					for (j = 0; j < BLOCK_SIZE_ROW; j++)
-					{
-						X0[(iRow + i) * nElemPerMatrix + iCol + j] = accuVal[i][j];
-					}
-				}		
-			}
-		}
-	}
-
-
-	return;
-}
 
 #define NSTREAM 4
 #define BDIM 128
@@ -485,130 +367,89 @@ int main(int argc, char **argv)
 	float *X_base;
 	float *X;
 	
-	G = (float *)malloc((nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
-	Y = (float *)malloc(nElem * 64 * sizeof(float));
+	//G = (float *)malloc((nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
+	//Y = (float *)malloc(nElem * 64 * sizeof(float));
 //	N0 = (float *)malloc(nElem * 64 * sizeof(float));
-	X = (float *)malloc(nElem * 64 * sizeof(float));
-	X_base = (float *)malloc(nElem * 64 * sizeof(float));
+	//X = (float *)malloc(nElem * 64 * sizeof(float));
+	//X_base = (float *)malloc(nElem * 64 * sizeof(float));
 
-	
-	initialData_f32(G, (nElem / nElemPerMatrix) * 64 * 64);
+	//int16_t *h_ScaleLUT;
+	Mimo64_alloc_host_mem((void **)&G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
+	Mimo64_alloc_host_mem((void **)&Y, nElem * 64 * sizeof(float));
+	Mimo64_alloc_host_mem((void **)&X_base, nElem * 64 * sizeof(float)); 
+	Mimo64_alloc_host_mem((void **)&X, nElem * 64 * sizeof(float));
+
+	float *d_G;
+	float *d_Y;
+	float *d_X;
+
+	Mimo64_alloc_device_mem((void **)&d_G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
+	Mimo64_alloc_device_mem((void **)&d_Y, nElem * 64 * sizeof(float));
+	Mimo64_alloc_device_mem((void **)&d_X, nElem * 64 * sizeof(float));
+
+    memset(X, 0, nElem * 64 * sizeof(float));
+    memset(X_base,  0, nElem * 64 * sizeof(float));
+
+ 	initialData_f32(G, (nElem / nElemPerMatrix) * 64 * 64);
 	initialData_f32(Y, nElem * 64);
 
 	mimo64_naive_kernel(G, Y, X_base, nElem, nElemPerMatrix);
-
-	float t_val[10];
 	long t_start = useconds();
 
 	mimo64_naive_kernel(G, Y, X_base, nElem, nElemPerMatrix);
 	
 	long t_end = useconds();
 	printf("mimo64_naive_kernel() costs %ld us \n", (t_end - t_start) );
-	t_val[0] = t_end - t_start;
 
-	t_start = useconds();
-	mimo64_naive_kernel(G, Y, X_base, nElem, nElemPerMatrix);	
-	t_end = useconds();
-	printf("mimo64_naive_kernel() costs %ld us \n", (t_end - t_start) );
-	t_val[1] = t_end - t_start;
+    float kernel_time;
+    cudaEvent_t start, stop;
+    CHECK(cudaEventCreate(&start));
+    CHECK(cudaEventCreate(&stop));
 
-	t_start = useconds();
-	mimo64_naive_kernel(G, Y, X_base, nElem, nElemPerMatrix);	
-	t_end = useconds();
-	printf("mimo64_naive_kernel() costs %ld us \n", (t_end - t_start) );
-	t_val[2] = t_end - t_start;
-
-	long t_val_avg = (t_val[1] + t_val[2]) / 2;
-	int num_mads = nElem * 64 * 64; // number of multiply-and-accumulate ops
-
-	double measured_naive_throughput = (num_mads / (t_val_avg * 0.000001)) / 1e9;
-	printf("num_mads: %d time: %d throughput: %f Gflops\n", num_mads, t_val_avg, measured_naive_throughput);
-
-	t_start = useconds();
-	mimo64_block_kernel(G, Y, X, nElem, nElemPerMatrix);	
-	t_end = useconds();
-
-	printf("mimo64_block_kernel() costs %ld us \n", (t_end - t_start) );
+    dim3 block (4, 64);
+    dim3 grid  ((nElem + block.x - 1) / block.x);
 	
-	t_start = useconds();
-	mimo64_block_kernel(G, Y, X_base, nElem, nElemPerMatrix);	
-	t_end = useconds();
+	CHECK(cudaMemcpy(d_G, G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_Y, Y, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 
-	printf("mimo64_block_kernel() costs %ld us \n", (t_end - t_start) );
+  	CHECK(cudaEventRecord(start, 0));
+
+    mimo64_naive_gpu_kernel<<<grid, block>>>(d_G, d_Y, d_X, nElem);
+
+    CHECK(cudaEventRecord(stop, 0));
+    CHECK(cudaEventSynchronize(stop));
+    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+
+    CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
 
 
-	t_start = useconds();
-	mimo64_cache_kernel(G, Y, X, nElem, nElemPerMatrix);
-	t_end = useconds();
+	CHECK(cudaMemcpy(d_G, G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_Y, Y, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 
-	printf("mimo64_cache_kernel() costs %ld us \n", (t_end - t_start) );
+  	CHECK(cudaEventRecord(start, 0));
 
-	t_start = useconds();
-	mimo64_cache_kernel(G, Y, X, nElem, nElemPerMatrix);
-	t_end = useconds();
+    mimo64_naive_gpu_kernel<<<grid, block>>>(d_G, d_Y, d_X, nElem);
 
-	printf("mimo64_cache_kernel() costs %ld us \n", (t_end - t_start) );
+    CHECK(cudaEventRecord(stop, 0));
+    CHECK(cudaEventSynchronize(stop));
+    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
 
+    CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
+
+	printf("mimo64_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
 	checkResult(X, X_base, nElem * 64);
 
+	Mimo64_free_host_mem(G);
+	Mimo64_free_host_mem(Y);
+	Mimo64_free_host_mem(X_base);
+	Mimo64_free_host_mem(X);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#if 0
-	//int16_t *h_ScaleLUT;
-	Mimo64_alloc_host_mem((void **)&h_A, nElem * 4); // uint32_t
-	Mimo64_alloc_host_mem((void **)&h_B, nElem);
-	Mimo64_alloc_host_mem((void **)&hostRef, nElem * 8); // 1 uint32_t will have 8 soft bytes
-	Mimo64_alloc_host_mem((void **)&gpuRef, nElem * 8);
-
-	uint32_t *d_A;
-	uint8_t *d_B;
-	uint8_t *d_C;
-
-	Mimo64_alloc_device_mem((void **)&d_A, nElem * 4);
-	Mimo64_alloc_device_mem((void **)&d_B, nElem);
-	Mimo64_alloc_device_mem((void **)&d_C, nElem * 8);
-
-    // initialize data at host side
-    initialData_u32(h_A, nElem);
-    initialData_u8(h_B, nElem);
+	Mimo64_free_device_mem(d_G);
+	Mimo64_free_device_mem(d_Y);
+	Mimo64_free_device_mem(d_X);
 	
-    memset(hostRef, 0, nElem * 8);
-    memset(gpuRef,  0, nElem * 8);
 
-    // add vector at host side for result checks
-    //sumArraysOnHost(h_A, h_B, hostRef, nElem);
-
-    // check device results
-    //checkResult(hostRef, gpuRef, nElem * 8);
-	
-	Mimo64_free_host_mem(h_A);
-	Mimo64_free_host_mem(h_B);
-	Mimo64_free_host_mem(hostRef);
-	Mimo64_free_host_mem(gpuRef);
-
-	Mimo64_free_device_mem(d_A);
-	Mimo64_free_device_mem(d_B);
-	Mimo64_free_device_mem(d_C);
-#endif
 
 	
 	return 0;
