@@ -70,48 +70,6 @@ void Mimo64_free_device_mem(void* dev_ptr)
 	return;
 }
 
-void initialData(float *ip, int size)
-{
-    int i;
-
-    for(i = 0; i < size; i++)
-    {
-        ip[i] = (float)(rand() & 0xFF) / 10.0f;
-    }
-}
-
-
-void initialData_u32(uint32_t *ip, int size)
-{
-    int i;
-
-    for(i = 0; i < size; i++)
-    {
-        ip[i] = (uint32_t)(rand() & 0xFFFFFFFF);
-    }
-}
-
-void initialData_u8(uint8_t *ip, int size)
-{
-    int i;
-
-    for(i = 0; i < size; i++)
-    {
-        ip[i] = (uint8_t)(rand() & 0xFF);
-    }
-}
-
-
-void initialData_s16(int16_t *ip, int size)
-{
-    int i;
-
-    for(i = 0; i < size; i++)
-    {
-        ip[i] = (int16_t)(rand() & 0xFFFF);
-		//printf("val[%d]: %d \n", i, ip[i]);
-    }
-}
 
 void initialData_f32(float *ip, int size)
 {
@@ -119,7 +77,7 @@ void initialData_f32(float *ip, int size)
 
     for(i = 0; i < size; i++)
     {
-        ip[i] = (float)(rand() & 0xFFFF);
+        ip[i] = (float)(rand() & 0xFF);
 		//printf("val[%d]: %d \n", i, ip[i]);
     }
 	
@@ -151,12 +109,6 @@ void Mimo64_createStreams(int numOfStreams){
 }
 
 
-void sumArraysOnHost(float *A, float *B, float *C, const int N)
-{
-    for (int idx = 0; idx < N; idx++)
-        C[idx] = A[idx] + B[idx];
-}
-
 void checkResult(float *hostRef, float *gpuRef, const int N)
 {
     double epsilon = 1.0E-8;
@@ -176,36 +128,8 @@ void checkResult(float *hostRef, float *gpuRef, const int N)
     if (match) printf("Arrays match.\n\n");
 }
 
-__global__ void sumArrays(float *A, float *B, float *C, const int N)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (idx < N)
-    {
-        for (int i = 0; i < N; ++i)
-        {
-            C[idx] = A[idx] + B[idx];
-        }
-    }
-}
 
-__global__ void warmingup(uint8_t *c)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    float ia, ib;
-    ia = ib = 0.0f;
-
-    if ((tid / warpSize) % 2 == 0)
-    {
-        ia = 100.0f;
-    }
-    else
-    {
-        ib = 200.0f;
-    }
-
-    c[tid] = (uint8_t)(ia + ib);
-}
 
 void mimo64_naive_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMatrix)
 {
@@ -273,6 +197,8 @@ __global__ void mimo64_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
 	int tid_x = Block_X_Idx * xLen + xIdx;
 	int tid_y = Block_Y_Idx * yLen + yIdx;
 	
+	// printf("xIdx: %d yIdx: %d \n", xIdx, yIdx);
+	
 	G0 = G + 64 * 64 * Block_X_Idx;
 	Y0 = Y + 64 * nElemPerMatrix * Block_X_Idx;
 	X0 = X + 64 * nElemPerMatrix * Block_X_Idx;
@@ -296,6 +222,7 @@ __global__ void mimo64_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
 		}
 	}
 	
+	// printf("tid: %d %d iRow: %d iCol: %d val: %f \n", tid_x, tid_y, iRow, iCol, X0[iRow * nElemPerMatrix + iCol]);
 
 	return;
 }
@@ -497,7 +424,7 @@ int main(int argc, char **argv)
     printf("> %s Starting...\n", argv[0]);
 	
     // set up data size of vectors
-    int nElem = 4; //273 * 12 * 14;
+    int nElem = 273 * 12 * 14;
 	const int nElemPerMatrix = 4;
     printf("> vector size = %d\n", nElem);
 
@@ -562,6 +489,7 @@ int main(int argc, char **argv)
 
     CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
 
+	printf("mimo64_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
 	CHECK(cudaMemcpy(d_G, G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_Y, Y, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
@@ -578,9 +506,9 @@ int main(int argc, char **argv)
 
 	printf("mimo64_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
-	checkResult(X, X_base, nElem * 64);
+	checkResult(X_base, X, nElem * 64);
 
-#if 1
+#if 0
 	const int BLOCK_SIZE_M = 2;
 	const int BLOCK_SIZE_N = 4;
 	const int BLOCK_SIZE_K = 2;
