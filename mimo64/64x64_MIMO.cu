@@ -155,11 +155,15 @@ void mimo64_naive_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMa
 				{
 					
 					accuVal += G0[iRow * 64 + iK] * Y0[iK * nElemPerMatrix + iCol];
-#if 0	
-if (iRow < 1 && iCol < 1)
+#if 0
+if (loopIdx == 0)
 {
-	printf("iRow: %d iCol: %d iK: %d accu: %f G0: %f Y0: %f \n", 
-	iRow, iCol, iK, accuVal, G0[iRow * 64 + iK], Y0[iK * nElemPerMatrix + iCol]);
+	for (iRow = 0; iRow < 64; iRow++)
+	{
+		printf("cpu iRow: %d Y0: %f %f %f %f \n", iRow, Y0[iRow * 4], Y0[iRow * 4 + 1], Y0[iRow * 4 + 2], Y0[iRow * 4 + 3]);
+	}		
+	// printf("iRow: %d iCol: %d iK: %d accu: %f G0: %f Y0: %f \n", 
+	// iRow, iCol, iK, accuVal, G0[iRow * 64 + iK], Y0[iK * nElemPerMatrix + iCol]);
 }
 #endif	
 				}
@@ -167,6 +171,19 @@ if (iRow < 1 && iCol < 1)
 				X0[iRow * nElemPerMatrix + iCol] = accuVal;
 			}
 		}
+		
+#if 0
+		if (loopIdx == 0)
+		{
+			for (iRow = 0; iRow < 64; iRow++)
+			{
+				printf("cpu iRow: %d G0: %f %f %f %f \n", iRow, G0[iRow * 64], G0[iRow * 64 + 1], G0[iRow * 64 + 2], G0[iRow * 64 + 3]);
+			}		
+			// printf("iRow: %d iCol: %d iK: %d accu: %f G0: %f Y0: %f \n", 
+			// iRow, iCol, iK, accuVal, G0[iRow * 64 + iK], Y0[iK * nElemPerMatrix + iCol]);
+		}
+#endif	
+		
 	}
 
 
@@ -249,15 +266,26 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 	int tid_x = Block_X_Idx * xLen + xIdx;
 	int tid_y = Block_Y_Idx * yLen + yIdx;
 
+	int xUnit = BLOCK_SIZE_K / xLen; // BLOCK_SIZE_K is multiple of xLen
+	
 	// shared memory
-	__shared__ float Gs[64][4]; // shared memory of G: 1 Kbyte
+	__shared__ float Gs[64][BLOCK_SIZE_K]; // shared memory of G: 256 bytes x BLOCK_SIZE_K
 	__shared__ float Ys[64][4]; // shared memory of Y: 1 Kbyte
 	
 	float accu[BLOCK_SIZE_M][BLOCK_SIZE_N];
+	float *G0, *Y0, *X0;
+
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
 
 	// load data from global memory to shared memeory
 	// load the whole Y 
 	int sLoadIdx;
+	float *Gs_0, *Ys_0;
+	Gs_0 = &Gs[0][0];
+	Ys_0 = &Ys[0][0];
+	
 	// each thread load BLOCK_SIZE_K * BLOCK_SIZE_N
 	#pragma unroll
 	for (i = 0; i < BLOCK_SIZE_K; i++)
@@ -265,34 +293,36 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 	    #pragma unroll
 		for (j = 0; j < BLOCK_SIZE_N; j++)
 		{
-			sLoadIdx = nElem * (tid_y * BLOCK_SIZE_K + i)
-						+ tid_x * BLOCK_SIZE_N + j;
+			sLoadIdx = (yIdx * BLOCK_SIZE_K + i) * 4
+						+ xIdx * BLOCK_SIZE_N + j;
 
-			Ys[yIdx * BLOCK_SIZE_K + i][j] = Y[sLoadIdx];
+			Ys_0[sLoadIdx] = Y0[sLoadIdx];
 // printf("tid: %d %d ldIdx: %d row: %d col: %d Y: %f \n", tid_x, tid_y, 
 //sLoadIdx, i, j, Ys[yIdx * BLOCK_SIZE_K + i][j]);
 
 		}
 	}
 	
-	int G_LEN_ONE_ROW = 64 * (nElem / 4);
 	
 	#pragma unroll
 	for (i = 0; i < BLOCK_SIZE_M; i++)
 	{
 	    #pragma unroll
-		for (j = 0; j < BLOCK_SIZE_K; j++)
+		for (j = 0; j < xUnit; j++)
 		{
-			sLoadIdx = G_LEN_ONE_ROW * (tid_y * BLOCK_SIZE_M + i)
-						+ tid_x * BLOCK_SIZE_K + j;
+			int mIdx = yIdx * BLOCK_SIZE_M + i;
+			// note: int kIdx = /*xIdx * BLOCK_SIZE_K +*/ j;
+			int kIdx = xIdx * xUnit + j; // BLOCK_SIZE_K: 1, 2, 4
 			
-			Gs[yIdx * BLOCK_SIZE_M + i][j] = G[sLoadIdx];
+			sLoadIdx = 64 * mIdx + kIdx;
+			
+			Gs[mIdx][kIdx] = G0[sLoadIdx];
 			
 			//if (tid_x == 0 && tid_y == 0)
 //printf("tid: %d %d ldIdx: %d row: %d col: %d G: %f Y: %f \n", tid_x, tid_y, sLoadIdx, i, j, Gs[i][j], Ys[i][j]);
 		}
 	}
-		
+
 	// reset the accumulation
 	#pragma unroll
 	for (i = 0; i < BLOCK_SIZE_M; i++)
@@ -305,15 +335,16 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 	}
 		
 	__syncthreads();
-#if 0		
- 	if ((tid_x == 0) && (tid_y == 0))
+#if 0
+ 	if ((xIdx == 0) && (yIdx == 0) && (Block_X_Idx == 0))
 	{
 		for (i = 0; i < 64; i++)
 		{
-			for (j = 0; j < 1; j++)
-			{
-				printf("i: %d j:%d  Y: %f \n", i, j,  Ys[i][j]);
-			}
+			//for (j = 0; j < 1; j++)
+			//{
+				//printf("gpu i: %d Y: %f %f %f %f\n", i, Ys[i][0], Ys[i][1], Ys[i][2], Ys[i][3]);
+printf("gpu i: %d G: %f %f \n", i, Gs[i][0], Gs[i][1]);
+			//}
 		}
 	}
 #endif	
@@ -341,7 +372,7 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 			#pragma unroll
 			for (j = 0; j < BLOCK_SIZE_N; j++)
 			{
-				val_Y[i][j] = Ys[(iTile - 1) * BLOCK_SIZE_K + i][j];
+				val_Y[i][j] = Ys[(iTile - 1) * BLOCK_SIZE_K + i][xIdx * BLOCK_SIZE_N + j];
 #if 0
 if (tid_x == 0 && tid_y == 0)
 {
@@ -376,18 +407,7 @@ if (tid_x == 0 && tid_y == 0 && i == 0 && j == 0)
 			}
 		}
 		
-		int storeIdx;
-		#pragma unroll
-		for (i = 0; i < BLOCK_SIZE_M; i++)
-		{
-			#pragma unroll
-			for (j = 0; j < BLOCK_SIZE_N; j++)
-			{
-				storeIdx = nElem * (tid_y * BLOCK_SIZE_M + i)
-							+ tid_x * BLOCK_SIZE_N + j;
-				X[storeIdx] = accu[i][j];
-			}
-		}
+
 		
 		if (iTile != loopIdx)
 		{
@@ -396,20 +416,54 @@ if (tid_x == 0 && tid_y == 0 && i == 0 && j == 0)
 			for (i = 0; i < BLOCK_SIZE_M; i++)
 			{
 				#pragma unroll
-				for (j = 0; j < BLOCK_SIZE_K; j++)
+				for (j = 0; j < xUnit; j++)
 				{
-					sLoadIdx = G_LEN_ONE_ROW * (tid_y * BLOCK_SIZE_M + i)
-								+ tid_x * BLOCK_SIZE_K + BLOCK_SIZE_K * iTile + j;
+				
+					int mIdx = yIdx * BLOCK_SIZE_M + i;
+					// note: int kIdx = /*xIdx * BLOCK_SIZE_K +*/ j;
+					int kIdx = xIdx * xUnit + j; // BLOCK_SIZE_K: 1, 2, 4
 					
-					Gs[yIdx * BLOCK_SIZE_M + i][j] = G[sLoadIdx];
+					sLoadIdx = 64 * mIdx + BLOCK_SIZE_K * iTile + kIdx;
+					
+					Gs[mIdx][kIdx] = G0[sLoadIdx];
 				}
 			}
 				
 			__syncthreads();
+			
+#if 0
+ 	if ((xIdx == 0) && (yIdx == 0) && (Block_X_Idx == 0))
+	{
+		for (i = 0; i < 64; i++)
+		{
+			//for (j = 0; j < 1; j++)
+			//{
+				//printf("gpu i: %d Y: %f %f %f %f\n", i, Ys[i][0], Ys[i][1], Ys[i][2], Ys[i][3]);
+printf("iteration %d gpu i: %d G: %f %f \n", iTile, i, Gs[i][0], Gs[i][1]);
+			//}
+		}
+	}
+#endif	
+			
 		}
 		
 		iTile++;
 	}
+	
+	int storeIdx;
+	#pragma unroll
+	for (i = 0; i < BLOCK_SIZE_M; i++)
+	{
+		#pragma unroll
+		for (j = 0; j < BLOCK_SIZE_N; j++)
+		{
+			storeIdx = (yIdx * BLOCK_SIZE_M + i) * 4
+						+ xIdx * BLOCK_SIZE_N + j;
+			X0[storeIdx] = accu[i][j];
+		}
+	}
+	
+	
 
 	return;
 }
@@ -508,7 +562,7 @@ int main(int argc, char **argv)
 
 	checkResult(X_base, X, nElem * 64);
 
-#if 0
+#if 1
 	const int BLOCK_SIZE_M = 2;
 	const int BLOCK_SIZE_N = 4;
 	const int BLOCK_SIZE_K = 2;
