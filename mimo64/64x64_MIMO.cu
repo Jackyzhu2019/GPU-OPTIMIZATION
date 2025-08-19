@@ -250,7 +250,7 @@ template <
     const int BLOCK_SIZE_N  // width of block of X that each thread calculate i.e. bn
     > 
 __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
-{	
+{
 	int i, j, k;
 	
 	// inside a block
@@ -286,23 +286,21 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 	Gs_0 = &Gs[0][0];
 	Ys_0 = &Ys[0][0];
 	
-	// each thread load BLOCK_SIZE_K * BLOCK_SIZE_N
-	#pragma unroll
-	for (i = 0; i < BLOCK_SIZE_K; i++)
+	
+	int nElemPerThread = 64 * 4 / (xLen * yLen);
+
+	int currentThreadIdx = yIdx * xLen + xIdx;
+	
+	// printf("nElemPerThread: %d x/y Len: %d %d. currentThreadIdx: %d \n", nElemPerThread, xIdx, yIdx, currentThreadIdx);
+
+	for (i = 0; i < nElemPerThread; i++)
 	{
-	    #pragma unroll
-		for (j = 0; j < BLOCK_SIZE_N; j++)
-		{
-			sLoadIdx = (yIdx * BLOCK_SIZE_K + i) * 4
-						+ xIdx * BLOCK_SIZE_N + j;
+		sLoadIdx = currentThreadIdx * nElemPerThread + i;
 
-			Ys_0[sLoadIdx] = Y0[sLoadIdx];
-// printf("tid: %d %d ldIdx: %d row: %d col: %d Y: %f \n", tid_x, tid_y, 
-//sLoadIdx, i, j, Ys[yIdx * BLOCK_SIZE_K + i][j]);
-
-		}
+		Ys_0[sLoadIdx] = Y0[sLoadIdx];
 	}
 	
+
 	
 	#pragma unroll
 	for (i = 0; i < BLOCK_SIZE_M; i++)
@@ -563,12 +561,16 @@ int main(int argc, char **argv)
 	checkResult(X_base, X, nElem * 64);
 
 #if 1
-	const int BLOCK_SIZE_M = 2;
-	const int BLOCK_SIZE_N = 4;
+	// memset d_X, X
+    memset(X, 0, nElem * 64 * sizeof(float));
+    CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
+
+	const int BLOCK_SIZE_M = 1;
+	const int BLOCK_SIZE_N = 2;
 	const int BLOCK_SIZE_K = 2;
 	
-	dim3 block1 (1, 32);
-    dim3 grid1  ((nElem + block1.y - 1) / block1.y);
+	dim3 block1 (4 / BLOCK_SIZE_N, 64 / BLOCK_SIZE_M);
+    dim3 grid1  ((nElem + 3) / 4); // 4 elements in one block
 
   	CHECK(cudaEventRecord(start, 0));
 
@@ -582,7 +584,7 @@ int main(int argc, char **argv)
 
 	printf("mimo64_block_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
-	checkResult(X, X_base, nElem * 64);
+	checkResult(X_base, X, nElem * 64);
 #endif
 
 	Mimo64_free_host_mem(G);
