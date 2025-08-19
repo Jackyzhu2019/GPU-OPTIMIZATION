@@ -286,6 +286,178 @@ __global__ void mimo64_block_naive_gpu_kernel(float *G, float *Y, float *X, int 
 	Gs_0 = &Gs[0][0];
 	Ys_0 = &Ys[0][0];
 	
+	int nElemPerThread = 64 * 4 / (xLen * yLen);
+
+	int currentThreadIdx = yIdx * xLen + xIdx;
+	
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		sLoadIdx = currentThreadIdx * nElemPerThread + i;
+
+		Ys_0[sLoadIdx] = Y0[sLoadIdx];
+	}
+	
+	#pragma unroll
+	for (i = 0; i < BLOCK_SIZE_M; i++)
+	{
+	    #pragma unroll
+		for (j = 0; j < xUnit; j++)
+		{
+			int mIdx = yIdx * BLOCK_SIZE_M + i;
+			// note: int kIdx = /*xIdx * BLOCK_SIZE_K +*/ j;
+			int kIdx = xIdx * xUnit + j; // BLOCK_SIZE_K: 1, 2, 4
+			
+			sLoadIdx = 64 * mIdx + kIdx;
+			
+			Gs[mIdx][kIdx] = G0[sLoadIdx];
+		}
+	}
+
+	// reset the accumulation
+	#pragma unroll
+	for (i = 0; i < BLOCK_SIZE_M; i++)
+	{
+		#pragma unroll
+		for (j = 0; j < BLOCK_SIZE_N; j++)
+		{
+				accu[i][j] = 0.0f;
+		}
+	}
+		
+	__syncthreads();
+
+	// load from shared memory to register
+	float val_G[BLOCK_SIZE_M][BLOCK_SIZE_K];
+	float val_Y[BLOCK_SIZE_K][BLOCK_SIZE_N];
+	
+	const int loopIdx = 64 / BLOCK_SIZE_K;
+	int iTile = 1;
+	while (iTile <= loopIdx)
+	{
+		#pragma unroll
+		for (i = 0; i < BLOCK_SIZE_M; i++)
+		{
+			#pragma unroll
+			for (j = 0; j < BLOCK_SIZE_K; j++)
+			{
+				val_G[i][j] = Gs[yIdx * BLOCK_SIZE_M + i][j];
+			}
+		}
+		
+		#pragma unroll
+		for (i = 0; i < BLOCK_SIZE_K; i++)
+		{
+			#pragma unroll
+			for (j = 0; j < BLOCK_SIZE_N; j++)
+			{
+				val_Y[i][j] = Ys[(iTile - 1) * BLOCK_SIZE_K + i][xIdx * BLOCK_SIZE_N + j];		
+			}
+		}
+
+		// matrix multiply
+		#pragma unroll
+		for (i = 0; i < BLOCK_SIZE_M; i++)
+		{
+			#pragma unroll
+			for (j = 0; j < BLOCK_SIZE_N; j++)
+			{
+				#pragma unroll
+				for (k = 0; k < BLOCK_SIZE_K; k++)
+				{
+					accu[i][j] += val_G[i][k] * val_Y[k][j];
+				}
+			}
+		}
+		
+
+		
+		if (iTile != loopIdx)
+		{
+			// next G data: BLOCK_SIZE_M * BLOCK_SIZE_K 
+			#pragma unroll
+			for (i = 0; i < BLOCK_SIZE_M; i++)
+			{
+				#pragma unroll
+				for (j = 0; j < xUnit; j++)
+				{
+				
+					int mIdx = yIdx * BLOCK_SIZE_M + i;
+					// note: int kIdx = /*xIdx * BLOCK_SIZE_K +*/ j;
+					int kIdx = xIdx * xUnit + j; // BLOCK_SIZE_K: 1, 2, 4
+					
+					sLoadIdx = 64 * mIdx + BLOCK_SIZE_K * iTile + kIdx;
+					
+					Gs[mIdx][kIdx] = G0[sLoadIdx];
+				}
+			}
+				
+			__syncthreads();
+			
+		}
+		
+		iTile++;
+	}
+	
+	int storeIdx;
+	#pragma unroll
+	for (i = 0; i < BLOCK_SIZE_M; i++)
+	{
+		#pragma unroll
+		for (j = 0; j < BLOCK_SIZE_N; j++)
+		{
+			storeIdx = (yIdx * BLOCK_SIZE_M + i) * 4
+						+ xIdx * BLOCK_SIZE_N + j;
+			X0[storeIdx] = accu[i][j];
+		}
+	}
+	
+	
+
+	return;
+}
+
+template <
+    const int BLOCK_SIZE_M,  // height of block of X that each thread calculate, i.e. bm
+    const int BLOCK_SIZE_K,  // width of block of G that each thread load into shared memory, i.e. bk
+    const int BLOCK_SIZE_N  // width of block of X that each thread calculate i.e. bn
+    > 
+__global__ void mimo64_block_revised_gpu_kernel(float *G, float *Y, float *X, int nElem)
+{
+	int i, j, k;
+	
+	// inside a block
+	int xIdx = threadIdx.x; 
+	int yIdx = threadIdx.y;
+	// block shape
+	int xLen = blockDim.x;
+	int yLen = blockDim.y;
+	// block index
+	int Block_X_Idx = blockIdx.x;
+	int Block_Y_Idx = blockIdx.y; // 0
+	
+	int tid_x = Block_X_Idx * xLen + xIdx;
+	int tid_y = Block_Y_Idx * yLen + yIdx;
+
+	int xUnit = BLOCK_SIZE_K / xLen; // BLOCK_SIZE_K is multiple of xLen
+	
+	// shared memory
+	__shared__ float Gs[64][BLOCK_SIZE_K]; // shared memory of G: 256 bytes x BLOCK_SIZE_K
+	__shared__ float Ys[64][4]; // shared memory of Y: 1 Kbyte
+	
+	float accu[BLOCK_SIZE_M][BLOCK_SIZE_N];
+	float *G0, *Y0, *X0;
+
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+
+	// load data from global memory to shared memeory
+	// load the whole Y 
+	int sLoadIdx;
+	float *Gs_0, *Ys_0;
+	Gs_0 = &Gs[0][0];
+	Ys_0 = &Ys[0][0];
+	
 	
 	int nElemPerThread = 64 * 4 / (xLen * yLen);
 
@@ -466,8 +638,6 @@ printf("iteration %d gpu i: %d G: %f %f \n", iTile, i, Gs[i][0], Gs[i][1]);
 	return;
 }
 
-
-
 #define NSTREAM 4
 #define BDIM 128
 
@@ -565,9 +735,10 @@ int main(int argc, char **argv)
     memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 
-	const int BLOCK_SIZE_M = 1;
-	const int BLOCK_SIZE_N = 2;
-	const int BLOCK_SIZE_K = 2;
+	// (M, N, K) = (1, 1, 4), (1, 1, 2), (2, 1, 4), (2, 2, 4), (4, 1, 2), (4, 1, 4), (1, 2, 4), (2, 1, 8)
+	const int BLOCK_SIZE_M = 2;
+	const int BLOCK_SIZE_N = 1;
+	const int BLOCK_SIZE_K = 4;
 	
 	dim3 block1 (4 / BLOCK_SIZE_N, 64 / BLOCK_SIZE_M);
     dim3 grid1  ((nElem + 3) / 4); // 4 elements in one block
@@ -586,6 +757,35 @@ int main(int argc, char **argv)
 
 	checkResult(X_base, X, nElem * 64);
 #endif
+
+#if 1
+	// memset d_X, X
+    memset(X, 0, nElem * 64 * sizeof(float));
+    CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
+
+	// (M, N, K) = (1, 1, 4), (1, 1, 2), (2, 1, 4), (2, 2, 4), (4, 1, 2), (4, 1, 4), (1, 2, 4), (2, 1, 8)
+	const int BLOCK_SIZE_M = 2;
+	const int BLOCK_SIZE_N = 1;
+	const int BLOCK_SIZE_K = 4;
+	
+	dim3 block1 (4 / BLOCK_SIZE_N, 64 / BLOCK_SIZE_M);
+    dim3 grid1  ((nElem + 3) / 4); // 4 elements in one block
+
+  	CHECK(cudaEventRecord(start, 0));
+
+    mimo64_block_revised_gpu_kernel<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N><<<grid1, block1>>>(d_G, d_Y, d_X, nElem);
+
+    CHECK(cudaEventRecord(stop, 0));
+    CHECK(cudaEventSynchronize(stop));
+    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+
+    CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
+
+	printf("mimo64_block_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+
+	checkResult(X_base, X, nElem * 64);
+#endif
+
 
 	Mimo64_free_host_mem(G);
 	Mimo64_free_host_mem(Y);
