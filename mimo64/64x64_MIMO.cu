@@ -120,7 +120,7 @@ void checkResult(float *hostRef, float *gpuRef, const int N)
         {
             match = 0;
             printf("Arrays do not match!\n");
-            printf("host %f gpu %f at %d\n", hostRef[i], gpuRef[i], i);
+            printf("host %f gpu %f at %d (block: %d, thread: %d)\n", hostRef[i], gpuRef[i], i, i / (64 * 4), i % (64 * 4));
             break;
         }
     }
@@ -154,35 +154,12 @@ void mimo64_naive_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMa
 				for (iK = 0; iK < 64; iK++)
 				{
 					
-					accuVal += G0[iRow * 64 + iK] * Y0[iK * nElemPerMatrix + iCol];
-#if 0
-if (loopIdx == 0)
-{
-	for (iRow = 0; iRow < 64; iRow++)
-	{
-		printf("cpu iRow: %d Y0: %f %f %f %f \n", iRow, Y0[iRow * 4], Y0[iRow * 4 + 1], Y0[iRow * 4 + 2], Y0[iRow * 4 + 3]);
-	}		
-	// printf("iRow: %d iCol: %d iK: %d accu: %f G0: %f Y0: %f \n", 
-	// iRow, iCol, iK, accuVal, G0[iRow * 64 + iK], Y0[iK * nElemPerMatrix + iCol]);
-}
-#endif	
+					accuVal += G0[iRow * 64 + iK] * Y0[iK * nElemPerMatrix + iCol];	
 				}
 				
 				X0[iRow * nElemPerMatrix + iCol] = accuVal;
 			}
 		}
-		
-#if 0
-		if (loopIdx == 0)
-		{
-			for (iRow = 0; iRow < 64; iRow++)
-			{
-				printf("cpu iRow: %d G0: %f %f %f %f \n", iRow, G0[iRow * 64], G0[iRow * 64 + 1], G0[iRow * 64 + 2], G0[iRow * 64 + 3]);
-			}		
-			// printf("iRow: %d iCol: %d iK: %d accu: %f G0: %f Y0: %f \n", 
-			// iRow, iCol, iK, accuVal, G0[iRow * 64 + iK], Y0[iK * nElemPerMatrix + iCol]);
-		}
-#endif	
 		
 	}
 
@@ -195,10 +172,6 @@ __global__ void mimo64_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
 	int loopIdx;
 	int iRow, iCol, iK;
 	float *G0, *Y0, *X0;
-	
-	int M = 64;
-	int K = 64;
-	int N = 4;
 	int nElemPerMatrix = 4;
 	
 	// inside a block
@@ -239,8 +212,6 @@ __global__ void mimo64_naive_gpu_kernel(float *G, float *Y, float *X, int nElem)
 		}
 	}
 	
-	// printf("tid: %d %d iRow: %d iCol: %d val: %f \n", tid_x, tid_y, iRow, iCol, X0[iRow * nElemPerMatrix + iCol]);
-
 	return;
 }
 
@@ -565,7 +536,7 @@ __global__ void mimo64_block_revised_gpu_kernel(float *G, float *Y, float *X, in
 		if (iTile != loopIdx)
 		{
 			// next G data: BLOCK_SIZE_M * BLOCK_SIZE_K 
-if (iTile >= 12)//(iTile != 13 && iTile != 2)
+if (1) 
 {
 			#pragma unroll
 			for (i = 0; i < BLOCK_SIZE_M; i++)
@@ -583,10 +554,18 @@ if (iTile >= 12)//(iTile != 13 && iTile != 2)
 					Gs[mIdx][kIdx] = G0[sLoadIdx];
 				}
 			}
-} else {
-			sLoadIdx = currentThreadIdx;
+}
 
+else 
+{
+			sLoadIdx = yIdx * xLen + xIdx;;
+
+
+			yIdxK = sLoadIdx / BLOCK_SIZE_K;
+			xIdxK = sLoadIdx  -  yIdxK * BLOCK_SIZE_K;
+			
 			sGLoadIdx = yIdxK * 64 + xIdxK + BLOCK_SIZE_K * iTile;
+
 
 			//if ((blockIdx.x == 0) && (blockIdx.y == 0))
 			//	printf("iTile: %d yIdxK: %d xIdxK: %d \n", iTile, yIdxK, xIdxK);
@@ -598,7 +577,7 @@ if (iTile >= 12)//(iTile != 13 && iTile != 2)
 				//sGLoadIdx = yIdxK * 64 + xIdxK;
 				sGLoadIdx += G_ElemGap * 64;
 			}
-}			
+}
 
 			__syncthreads();
 		}
@@ -624,8 +603,7 @@ if (iTile >= 12)//(iTile != 13 && iTile != 2)
 	return;
 }
 
-#define NSTREAM 4
-#define BDIM 128
+
 
 int main(int argc, char **argv)
 {
@@ -716,7 +694,7 @@ int main(int argc, char **argv)
 
 	checkResult(X_base, X, nElem * 64);
 
-#if 1
+#if 0
 	// memset d_X, X
     memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
@@ -757,7 +735,7 @@ int main(int argc, char **argv)
 	dim3 block2 (4 / BLOCK_SIZE_N_2, 64 / BLOCK_SIZE_M_2);
     dim3 grid2  ((nElem + 3) / 4); // 4 elements in one block
 
-	printf("blockIdx.x: %d blockIdx.y: %d \n", block2.x, block2.y);
+	printf("gridIdx.x: %d blockIdx.x: %d blockIdx.y: %d \n", grid2.x, block2.x, block2.y);
 
   	CHECK(cudaEventRecord(start, 0));
 
