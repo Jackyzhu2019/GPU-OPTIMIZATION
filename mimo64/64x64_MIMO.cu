@@ -749,8 +749,8 @@ int main(int argc, char **argv)
     printf("> %s Starting...\n", argv[0]);
 	
     // set up data size of vectors
-    int nElem = 4; // 273 * 12 * 14;
-	const int nElemPerMatrix = 4;
+    int nElem = 16; // 273 * 12 * 14;
+	const int nElemPerMatrix = 16;
     printf("> vector size = %d\n", nElem);
 
     float *G;
@@ -811,11 +811,14 @@ int main(int argc, char **argv)
     CHECK(cudaEventCreate(&start));
     CHECK(cudaEventCreate(&stop));
 
+
+#if 0
     dim3 block (4, 64);
     dim3 grid  ((nElem + block.x - 1) / block.x);
 	
 	CHECK(cudaMemcpy(d_G, G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_Y, Y, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
+	
 
   	CHECK(cudaEventRecord(start, 0));
 
@@ -845,7 +848,7 @@ int main(int argc, char **argv)
 	printf("mimo64_naive_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
 	checkResult(X_base, X, nElem * 64);
-	
+#endif	
 	
 #if 1
 	memset(X, 0, nElem * 64 * sizeof(float));
@@ -861,8 +864,8 @@ int main(int argc, char **argv)
 
   	CHECK(cudaEventRecord(start, 0));
 	
-	dim3 block_wmma (4, 32);
-    dim3 grid_wmma  ((nElem + 3) / 4); // 4 elements in one block
+	dim3 block_wmma (128);
+    dim3 grid_wmma  ((nElem + 15) / 16); // 4 elements in one block
 
   	CHECK(cudaEventRecord(start, 0));
 
@@ -882,7 +885,7 @@ int main(int argc, char **argv)
 #endif
 
 
-#if 1
+#if 0
 	// memset d_X, X
     memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
@@ -913,7 +916,7 @@ int main(int argc, char **argv)
 	checkResult(X_base, X, nElem * 64);
 #endif
 
-#if 1
+#if 0
 	// memset d_X, X
     memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
