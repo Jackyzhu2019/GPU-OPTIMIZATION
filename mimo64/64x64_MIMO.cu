@@ -84,7 +84,7 @@ void initialData_f32(float *ip, int size)
 
     for(i = 0; i < size; i++)
     {
-        ip[i] = (float)(rand() & 0xFF);
+        ip[i] = (float)1.0;//(rand() & 0xFF);
 		//printf("val[%d]: %d \n", i, ip[i]);
     }
 
@@ -99,7 +99,7 @@ void initialData_Y_f32(float *ip, int size)
     for(i = 0; i < size; i++)
     {
 		if (i < size)
-			ip[i] = (float)(rand() & 0xFF);
+			ip[i] = (float) 1.0; //(rand() & 0xFF);
 		//printf("val[%d]: %d \n", i, ip[i]);
 		else
 			ip[i] = (float)0.0; //(rand() & 0xFF);
@@ -161,8 +161,6 @@ void checkResult(float *hostRef, float *gpuRef, const int N)
 
     if (match) printf("Arrays match.\n\n");
 }
-
-
 
 
 void mimo64_naive_kernel(float *G, float *Y, float *X, int nElem, int nElemPerMatrix)
@@ -570,7 +568,8 @@ __global__ void mimo64_block_revised_gpu_kernel(float *G, float *Y, float *X, in
 		if (iTile != loopIdx)
 		{
 			// next G data: BLOCK_SIZE_M * BLOCK_SIZE_K 
-if (1) 
+#if 0			
+if (0) 
 {
 			#pragma unroll
 			for (i = 0; i < BLOCK_SIZE_M; i++)
@@ -591,6 +590,7 @@ if (1)
 }
 
 else 
+#endif
 {
 			sLoadIdx = yIdx * xLen + xIdx;;
 
@@ -811,13 +811,212 @@ __global__ void mimo64_wmma_block16_gpu_kernel(float16_t *G, float16_t *Y, float
 }
 
 
+
+__global__ void mimo64_wmma_naive4_col_gpu_kernel(float16_t *G, float16_t *Y, float *X, int nElem)
+{	
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+	
+    // init accumulation
+    wmma::fill_fragment(c_frag, 0.0f);
+    
+    // find the warp id
+	int tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warpID = tid >> 5;
+	float16_t *G0, *Y0;
+	float *X0;
+	int Block_X_Idx = blockIdx.x;
+
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+
+	// printf("tid: %d \n", tid);
+	int M = 64;
+	int N = 4;
+	int K = 64;
+    // main loop
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) {
+        // load data
+        wmma::load_matrix_sync(a_frag, Y0 + k_step * N, N);
+        wmma::load_matrix_sync(b_frag, G0 + warpID * WMMA_M * K + k_step, K);
+        
+        // multiplication excution
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+    
+    // result store
+    wmma::store_matrix_sync(X0 + warpID * WMMA_M * N, c_frag, N, wmma::mem_col_major);
+	
+	return;
+}
+
+__global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, float *X, int nElem)
+{
+	int i, j;
+	const int padding0 = 16;
+	const int padding1 = 16;
+
+	// shared memory
+	__shared__ float16_t Gs_tr[16][64 + padding0]; // shared memory of G: 2 Kbyte
+	__shared__ float16_t Ys_tr[16][64 + padding1]; // shared memory of Y: 2 Kbyte
+	__shared__ float Xs_tr[16][64 + padding1]; // shared memory of Y: 2 Kbyte
+
+	float16_t *G0, *Y0;
+	float *X0;
+	int Block_X_Idx = blockIdx.x;
+	
+	// find the warp id
+    //int warp_row = (blockIdx.y * blockDim.y + threadIdx.y) / warpSize;
+    //int warp_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warpID = tid >> 5;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+	
+	int M = 64;
+	int N = 16;
+	int K = 64;
+		
+	int blockSize = blockDim.x * blockDim.y; // multple of 32s
+	float16_t *Gs_tr_0, *Ys_tr_0;
+	Gs_tr_0 = &Gs_tr[0][0];
+	Ys_tr_0 = &Ys_tr[0][0];
+	float *Xs;
+	Xs = &Xs_tr[0][0];
+	
+	// load Y0 to shared memory
+	int nElemPerThread = 64 * 4 / blockSize;
+	int nElemPerThread1 = 64 * 16 / blockSize;
+
+	int sLoadIdx = tid;
+	int YLoadIdx_0 = tid >> 2;
+	int YLoadIdx_1 = tid & 3;
+	
+	// transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		Ys_tr[YLoadIdx_1][YLoadIdx_0] = Y0[sLoadIdx];
+	
+		sLoadIdx += blockSize;
+		YLoadIdx_0 += (blockSize >> 2);
+	}
+
+	// clear the padding elements ===> 4 x 64 padding to 16 x 64
+	float16_t zero_half = __float2half(0.0f);
+	int nElemPerThread2 = nElemPerThread1 - nElemPerThread;
+	YLoadIdx_0 = 4 + (tid >> 6); // padding from the 4th line
+	YLoadIdx_1 = tid & 63;
+
+	for (i = 0; i < nElemPerThread2; i++)
+	{
+		Ys_tr[YLoadIdx_0][YLoadIdx_1] = zero_half;
+		YLoadIdx_0 += (blockSize >> 6);
+	}
+	
+
+	
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+	// init accumulation
+    wmma::fill_fragment(c_frag, 0.0f);
+
+	int GLoadIdx_0, GLoadIdx_1;
+	GLoadIdx_1 = tid & 15;
+
+	//__syncthreads();
+
+	//printf("tid: %d Ys: %f %f \n", tid, __half2float(Ys_tr[0][0]), __half2float(Ys_tr[4][0]));
+	
+	//__syncthreads();
+
+    // main loop
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) {
+		
+		// load G0 to shared memory
+		sLoadIdx = tid;
+		GLoadIdx_0 = tid >> 4;
+	
+        for (i = 0; i < nElemPerThread1; i++)
+		{
+			Gs_tr[GLoadIdx_1][GLoadIdx_0] = G0[GLoadIdx_0 * 64 + k_step + GLoadIdx_1];
+			//sLoadIdx += blockSize;
+			GLoadIdx_0 += (blockSize >> 4);
+		}
+
+		__syncthreads();
+		
+		
+	//__syncthreads();
+
+	//printf("tid: %d k_step: %d Ys: %f %f \n", tid, k_step, __half2float(Gs_tr[0][0]), __half2float(Gs_tr[4][0]));
+	
+	//__syncthreads();
+		
+		// load data
+        wmma::load_matrix_sync(a_frag, Ys_tr_0 + k_step, 64 + padding1);
+        wmma::load_matrix_sync(b_frag, Gs_tr_0 + warpID * WMMA_K, 64 + padding0);
+        
+        // multiplication excution
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // result store
+    wmma::store_matrix_sync(Xs + warpID * 16, c_frag, 64 + padding1, wmma::mem_row_major);
+	
+	__syncthreads();
+
+	sLoadIdx = tid;
+	int XLoadIdx_0 = tid >> 2;
+	int XLoadIdx_1 = tid & 3;
+
+	// transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		X0[sLoadIdx] = Xs_tr[XLoadIdx_1][XLoadIdx_0];
+	
+		sLoadIdx += blockSize;
+		XLoadIdx_0 += (blockSize >> 2);
+	}
+	
+#if 0
+	__syncthreads();
+	if (tid == 0)
+	{
+
+
+		printf("#################################################\n");
+		for (i = 0; i < 16; i++)
+		{
+			for (j = 0; j < 64; j++)
+			{
+				printf("%f ", Xs_tr[i][j]);
+			}
+			
+			printf("\n");
+		}		
+	}
+	
+	__syncthreads();
+#endif
+	
+	
+	return;
+}
+
+
 int main(int argc, char **argv)
 {
     printf("> %s Starting...\n", argv[0]);
 	
     // set up data size of vectors
     int nElem = 273 * 12 * 14;
-	const int nElemPerMatrix = 16;
+	const int nElemPerMatrix = 4;
     printf("> vector size = %d\n", nElem);
 
     float *G;
@@ -839,7 +1038,7 @@ int main(int argc, char **argv)
 	Mimo64_alloc_host_mem((void **)&G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&Y, nElem * 64 * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&X_base, nElem * 64 * sizeof(float)); 
-	Mimo64_alloc_host_mem((void **)&X, nElem * 64 * sizeof(float));
+	Mimo64_alloc_host_mem((void **)&X, (nElem) * 64 * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&G_f16, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&Y_f16, nElem * 64 * sizeof(float));
 
@@ -853,7 +1052,7 @@ int main(int argc, char **argv)
 
 	Mimo64_alloc_device_mem((void **)&d_G, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float));
 	Mimo64_alloc_device_mem((void **)&d_Y, nElem * 64 * sizeof(float));
-	Mimo64_alloc_device_mem((void **)&d_X, nElem * 64 * sizeof(float));
+	Mimo64_alloc_device_mem((void **)&d_X, (nElem) * 64 * sizeof(float));
 	
 	Mimo64_alloc_device_mem((void **)&d_G16, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float16_t));
 	Mimo64_alloc_device_mem((void **)&d_Y16, nElem * 64 * sizeof(float16_t));
@@ -879,7 +1078,9 @@ int main(int argc, char **argv)
     CHECK(cudaEventCreate(&stop));
 
 
-#if 0
+
+
+#if 1
     dim3 block (4, 64);
     dim3 grid  ((nElem + block.x - 1) / block.x);
 	
@@ -926,6 +1127,40 @@ int main(int argc, char **argv)
 	float2half(G_f16, G, (nElem / nElemPerMatrix) * 64 * 64);
 	float2half(Y_f16, Y, nElem * 64);
 
+
+
+	CHECK(cudaMemcpy(d_G16, G_f16, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float16_t), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_Y16, Y_f16, nElem * 64 * sizeof(float16_t), cudaMemcpyHostToDevice));
+
+  	CHECK(cudaEventRecord(start, 0));
+	
+	dim3 block_wmma_c4 (128);
+    dim3 grid_wmma_c4  ((nElem + 3) / 4); // 4 elements in one block
+
+  	CHECK(cudaEventRecord(start, 0));
+
+    mimo64_wmma_block4_col_gpu_kernel<<<grid_wmma_c4, block_wmma_c4>>>(d_G16, d_Y16, d_X, nElem);
+
+    CHECK(cudaEventRecord(stop, 0));
+    CHECK(cudaEventSynchronize(stop));
+    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+
+    CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
+
+	printf("mimo64_wmma_naive4_col_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+
+	checkResult(X_base, X, nElem * 64);	
+#endif
+
+#if 0
+	memset(X, 0, nElem * 64 * sizeof(float));
+    CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
+
+	memset(Y_f16, 0, nElem * 64 * sizeof(float));
+
+	float2half(G_f16, G, (nElem / nElemPerMatrix) * 64 * 64);
+	float2half(Y_f16, Y, nElem * 64);
+
 	CHECK(cudaMemcpy(d_G16, G_f16, (nElem / nElemPerMatrix) * 64 * 64 * sizeof(float16_t), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_Y16, Y_f16, nElem * 64 * sizeof(float16_t), cudaMemcpyHostToDevice));
 
@@ -949,7 +1184,7 @@ int main(int argc, char **argv)
 	checkResult(X_base, X, nElem * 64);	
 #endif
 
-#if 1
+#if 0
 	memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 
@@ -983,7 +1218,7 @@ int main(int argc, char **argv)
 	
 #endif
 
-#if 1
+#if 0
 	memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 	
@@ -1016,7 +1251,7 @@ int main(int argc, char **argv)
 #endif
 
 
-#if 1
+#if 0
 	memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
 	
@@ -1081,7 +1316,7 @@ int main(int argc, char **argv)
 	checkResult(X_base, X, nElem * 64);
 #endif
 
-#if 0
+#if 1
 	// memset d_X, X
     memset(X, 0, nElem * 64 * sizeof(float));
     CHECK(cudaMemcpy(d_X, X, nElem * 64 * sizeof(float), cudaMemcpyHostToDevice));
