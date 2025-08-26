@@ -8,6 +8,9 @@
 
 using namespace nvcuda;
 
+#define DOUBLE(pointer) (reinterpret_cast<double*>(&(pointer))[0])
+#define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+
 #define float16_t half
 
 
@@ -84,7 +87,7 @@ void initialData_f32(float *ip, int size)
 
     for(i = 0; i < size; i++)
     {
-        ip[i] = (float)1.0;//(rand() & 0xFF);
+        ip[i] = (float)(rand() & 0xFF);
 		//printf("val[%d]: %d \n", i, ip[i]);
     }
 
@@ -99,7 +102,7 @@ void initialData_Y_f32(float *ip, int size)
     for(i = 0; i < size; i++)
     {
 		if (i < size)
-			ip[i] = (float) 1.0; //(rand() & 0xFF);
+			ip[i] = (float) (rand() & 0xFF);
 		//printf("val[%d]: %d \n", i, ip[i]);
 		else
 			ip[i] = (float)0.0; //(rand() & 0xFF);
@@ -852,16 +855,16 @@ __global__ void mimo64_wmma_naive4_col_gpu_kernel(float16_t *G, float16_t *Y, fl
 	return;
 }
 
+const int padding0 = 16;
+const int padding1 = 16;
 __global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, float *X, int nElem)
 {
 	int i, j;
-	const int padding0 = 16;
-	const int padding1 = 16;
 
 	// shared memory
 	__shared__ float16_t Gs_tr[16][64 + padding0]; // shared memory of G: 2 Kbyte
 	__shared__ float16_t Ys_tr[16][64 + padding1]; // shared memory of Y: 2 Kbyte
-	__shared__ float Xs_tr[16][64 + padding1]; // shared memory of Y: 2 Kbyte
+	__shared__ float Xs_tr[16][64 + padding1]; // shared memory of X: 4 Kbyte
 
 	float16_t *G0, *Y0;
 	float *X0;
@@ -929,12 +932,6 @@ __global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, fl
 	int GLoadIdx_0, GLoadIdx_1;
 	GLoadIdx_1 = tid & 15;
 
-	//__syncthreads();
-
-	//printf("tid: %d Ys: %f %f \n", tid, __half2float(Ys_tr[0][0]), __half2float(Ys_tr[4][0]));
-	
-	//__syncthreads();
-
     // main loop
     for (int k_step = 0; k_step < K; k_step += WMMA_K) {
 		
@@ -950,13 +947,6 @@ __global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, fl
 		}
 
 		__syncthreads();
-		
-		
-	//__syncthreads();
-
-	//printf("tid: %d k_step: %d Ys: %f %f \n", tid, k_step, __half2float(Gs_tr[0][0]), __half2float(Gs_tr[4][0]));
-	
-	//__syncthreads();
 		
 		// load data
         wmma::load_matrix_sync(a_frag, Ys_tr_0 + k_step, 64 + padding1);
@@ -979,6 +969,150 @@ __global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, fl
 	for (i = 0; i < nElemPerThread; i++)
 	{
 		X0[sLoadIdx] = Xs_tr[XLoadIdx_1][XLoadIdx_0];
+	
+		sLoadIdx += blockSize;
+		XLoadIdx_0 += (blockSize >> 2);
+	}
+	
+	return;
+}
+
+
+
+union SharedMemoryUnion {
+    struct {
+        float16_t  Gs[16][64 + padding0]; // 2KB FP16
+        float16_t  Ys[16][64 + padding1]; // 2KB FP16
+    };
+    float Xs[16][64 + padding1];       // 4KB FP32
+};
+
+__global__ void mimo64_wmma_block4_col_gpu_kernel_v2(float16_t *G, float16_t *Y, float *X, int nElem)
+{
+	int i, j;
+
+
+	// shared memory
+	__shared__ SharedMemoryUnion smem_GXY;
+
+ 
+	float16_t *G0, *Y0;
+	float *X0;
+	int Block_X_Idx = blockIdx.x;
+	
+	// find the warp id
+    //int warp_row = (blockIdx.y * blockDim.y + threadIdx.y) / warpSize;
+    //int warp_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warpID = tid >> 5;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+	
+	int M = 64;
+	int N = 16;
+	int K = 64;
+		
+	int blockSize = blockDim.x * blockDim.y; // multple of 32s
+	float16_t *Gs_tr_0, *Ys_tr_0;
+	Gs_tr_0 = &smem_GXY.Gs[0][0];
+	Ys_tr_0 = &smem_GXY.Ys[0][0];
+	float *Xs;
+	Xs = &smem_GXY.Xs[0][0];
+	
+	// load Y0 to shared memory
+	int nElemPerThread = 64 * 4 / blockSize;
+	int nElemPerThread1 = 64 * 16 / blockSize;
+
+	int sLoadIdx = tid;
+	int YLoadIdx_0 = tid >> 2;
+	int YLoadIdx_1 = tid & 3;
+	
+	// transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		smem_GXY.Ys[YLoadIdx_1][YLoadIdx_0] = Y0[sLoadIdx];
+	
+		sLoadIdx += blockSize;
+		YLoadIdx_0 += (blockSize >> 2);
+	}
+
+	// clear the padding elements ===> 4 x 64 padding to 16 x 64
+	float16_t zero_half = __float2half(0.0f);
+	int nElemPerThread2 = nElemPerThread1 - nElemPerThread;
+	YLoadIdx_0 = 4 + (tid >> 6); // padding from the 4th line
+	YLoadIdx_1 = tid & 63;
+
+	for (i = 0; i < nElemPerThread2; i++)
+	{
+		smem_GXY.Ys[YLoadIdx_0][YLoadIdx_1] = zero_half;
+		YLoadIdx_0 += (blockSize >> 6);
+	}
+	
+
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+
+	// init accumulation
+    wmma::fill_fragment(c_frag, 0.0f);
+
+	int GLoadIdx_0, GLoadIdx_1;
+	GLoadIdx_1 = tid & 15;
+
+	//__syncthreads();
+
+	//printf("tid: %d Ys: %f %f \n", tid, __half2float(Ys_tr[0][0]), __half2float(Ys_tr[4][0]));
+	
+	//__syncthreads();
+
+    // main loop
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) {
+		
+		// load G0 to shared memory
+		sLoadIdx = tid;
+		GLoadIdx_0 = tid >> 4;
+	
+        for (i = 0; i < nElemPerThread1; i++)
+		{
+			smem_GXY.Gs[GLoadIdx_1][GLoadIdx_0] = G0[GLoadIdx_0 * 64 + k_step + GLoadIdx_1];
+			//sLoadIdx += blockSize;
+			GLoadIdx_0 += (blockSize >> 4);
+		}
+
+		__syncthreads();
+		
+		
+	//__syncthreads();
+
+	//printf("tid: %d k_step: %d Ys: %f %f \n", tid, k_step, __half2float(Gs_tr[0][0]), __half2float(Gs_tr[4][0]));
+	
+	//__syncthreads();
+		
+		// load data
+        wmma::load_matrix_sync(a_frag, Ys_tr_0 + k_step, 64 + padding1);
+        wmma::load_matrix_sync(b_frag, Gs_tr_0 + warpID * WMMA_K, 64 + padding0);
+        
+        // multiplication excution
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+	__syncthreads();
+
+    // result store
+    wmma::store_matrix_sync(Xs + warpID * 16, c_frag, 64 + padding1, wmma::mem_row_major);
+	
+	__syncthreads();
+
+	sLoadIdx = tid;
+	int XLoadIdx_0 = tid >> 2;
+	int XLoadIdx_1 = tid & 3;
+
+	// transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		X0[sLoadIdx] = smem_GXY.Xs[XLoadIdx_1][XLoadIdx_0];
 	
 		sLoadIdx += blockSize;
 		XLoadIdx_0 += (blockSize >> 2);
@@ -1009,13 +1143,379 @@ __global__ void mimo64_wmma_block4_col_gpu_kernel(float16_t *G, float16_t *Y, fl
 	return;
 }
 
+union SharedMemoryUnion_combine {
+    struct {
+        float16_t  Gs[16+16][64 + padding0]; // 5120 bytes
+        float16_t  Ys[16+4][64 + padding1]; // 3200 bytes
+    };
+    float Xs[16+4][64 + padding1];       // 4KB FP32
+};
+__global__ void mimo64_wmma_block4_combine_gpu_kernel(float16_t *G, float16_t *Y, float *X, int nElem)
+{
+	int i, j;
+
+
+	// shared memory
+	__shared__ SharedMemoryUnion_combine smem_GXY;
+
+ 
+	float16_t *G0, *Y0, *G1;
+	float *X0;
+	int Block_X_Idx = blockIdx.x << 1;
+	
+	// find the warp id
+    //int warp_row = (blockIdx.y * blockDim.y + threadIdx.y) / warpSize;
+    //int warp_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warpID = tid >> 5;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	G1 = G0 + 64 * 64;
+
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+	
+	int M = 64;
+	int N = 16;
+	int K = 64;
+		
+	int blockSize = blockDim.x * blockDim.y; // multple of 32s
+	float16_t *Gs_tr_0, *Ys_tr_0;
+	Gs_tr_0 = &smem_GXY.Gs[0][0];
+	Ys_tr_0 = &smem_GXY.Ys[0][0];
+	float16_t *Gs_tr_1, *Ys_tr_1;
+	Gs_tr_1 = &smem_GXY.Gs[16][0];
+	Ys_tr_1 = &smem_GXY.Ys[4][0];
+
+	
+	float *Xs;
+	Xs = &smem_GXY.Xs[0][0];
+	
+	float *Xs_1;
+	Xs_1 = &smem_GXY.Xs[4][0];
+	
+	// load Y0 to shared memory
+	int nElemPerThread = 64 * 4 / blockSize;
+	int nElemPerThread1 = 64 * 16 / blockSize;
+
+	int sLoadIdx = tid;
+	int YLoadIdx_0 = tid >> 2;
+	int YLoadIdx_1 = tid & 3;
+	
+	// 1st batch: transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		smem_GXY.Ys[YLoadIdx_1][YLoadIdx_0] = Y0[sLoadIdx];
+	
+		sLoadIdx += blockSize;
+		YLoadIdx_0 += (blockSize >> 2);
+	}
+
+#if 1
+	// clear the padding elements ===> 4 x 64 padding to 16 x 64
+	float16_t zero_half = __float2half(0.0f);
+	int nElemPerThread2 = nElemPerThread1 - nElemPerThread;
+	YLoadIdx_0 = 4 + (tid >> 6); // padding from the 4th line
+	YLoadIdx_1 = tid & 63;
+
+	for (i = 0; i < nElemPerThread2; i++)
+	{
+		smem_GXY.Ys[YLoadIdx_0][YLoadIdx_1] = zero_half;
+		YLoadIdx_0 += (blockSize >> 6);
+	}
+#endif
+
+	YLoadIdx_1 = 16 + (tid & 3);
+	YLoadIdx_0 = (tid >> 2);
+	// 2nd batch: transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		smem_GXY.Ys[YLoadIdx_1][YLoadIdx_0] = Y0[sLoadIdx];
+	
+		sLoadIdx += blockSize;
+		YLoadIdx_0 += (blockSize >> 2);
+	}
+
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[2];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[2];
+
+	// init accumulation
+    wmma::fill_fragment(c_frag[0], 0.0f);
+    wmma::fill_fragment(c_frag[1], 0.0f);
+
+	int GLoadIdx_0, GLoadIdx_1;
+	GLoadIdx_1 = tid & 15;
+
+	//__syncthreads();
+
+	//printf("tid: %d Ys: %f %f \n", tid, __half2float(Ys_tr[0][0]), __half2float(Ys_tr[4][0]));
+	
+	//__syncthreads();
+
+    // main loop
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) {
+		
+		// load G0 to shared memory
+		sLoadIdx = tid;
+		GLoadIdx_0 = tid >> 4;
+	
+        for (i = 0; i < nElemPerThread1; i++)
+		{
+			smem_GXY.Gs[GLoadIdx_1][GLoadIdx_0] = G0[GLoadIdx_0 * 64 + k_step + GLoadIdx_1];
+			smem_GXY.Gs[16 + GLoadIdx_1][GLoadIdx_0] = G1[GLoadIdx_0 * 64 + k_step + GLoadIdx_1];
+
+			//sLoadIdx += blockSize;
+			GLoadIdx_0 += (blockSize >> 4);
+		}
+
+		__syncthreads();
+		
+		
+	//__syncthreads();
+
+	//printf("tid: %d k_step: %d Ys: %f %f \n", tid, k_step, __half2float(Gs_tr[0][0]), __half2float(Gs_tr[4][0]));
+	
+	//__syncthreads();
+		
+		// load data
+        wmma::load_matrix_sync(a_frag[0], Ys_tr_0 + k_step, 64 + padding1);
+        wmma::load_matrix_sync(a_frag[1], Ys_tr_1 + k_step, 64 + padding1);
+
+        wmma::load_matrix_sync(b_frag[0], Gs_tr_0 + warpID * WMMA_K, 64 + padding0);
+        wmma::load_matrix_sync(b_frag[1], Gs_tr_1 + warpID * WMMA_K, 64 + padding0);
+        
+        // multiplication excution
+        wmma::mma_sync(c_frag[0], a_frag[0], b_frag[0], c_frag[0]);
+        wmma::mma_sync(c_frag[1], a_frag[1], b_frag[1], c_frag[1]);
+	}
+
+	__syncthreads();
+
+    // result store
+    wmma::store_matrix_sync(Xs + warpID * 16, c_frag[0], 64 + padding1, wmma::mem_row_major);
+	wmma::store_matrix_sync(Xs_1 + warpID * 16, c_frag[1], 64 + padding1, wmma::mem_row_major);
+
+	__syncthreads();
+
+	sLoadIdx = tid;
+	int XLoadIdx_0 = tid >> 2;
+	int XLoadIdx_1 = tid & 3;
+
+	// transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		X0[sLoadIdx] = smem_GXY.Xs[XLoadIdx_1][XLoadIdx_0];
+		X0[64 * 4 + sLoadIdx] = smem_GXY.Xs[16 + XLoadIdx_1][XLoadIdx_0];
+
+		sLoadIdx += blockSize;
+		XLoadIdx_0 += (blockSize >> 2);
+	}
+	
+#if 0
+	__syncthreads();
+	if (tid == 0)
+	{
+
+
+		printf("#################################################\n");
+		for (i = 0; i < 16; i++)
+		{
+			for (j = 0; j < 64; j++)
+			{
+				printf("%f ", Xs_tr[i][j]);
+			}
+			
+			printf("\n");
+		}		
+	}
+	
+	__syncthreads();
+#endif
+	
+	
+	return;
+}
+
+
+union SharedMemoryUnion_combine_v2 {
+    struct {
+        float16_t  Gs[64][16+16]; // 4096 bytes
+        float16_t  Ys[64][16+16]; // 4096 bytes
+    };
+    float Xs[64][32];       // 8192 bytes FP32
+};
+
+__global__ void mimo64_wmma_block4_combine_gpu_kernel_v2(float16_t *G, float16_t *Y, float *X, int nElem)
+{
+	int i, j;
+
+
+	// shared memory
+	__shared__ SharedMemoryUnion_combine_v2 smem_GXY;
+
+ 
+	float16_t *G0, *Y0, *G1;
+	float *X0;
+	int Block_X_Idx = blockIdx.x << 1;
+	
+	// find the warp id
+    //int warp_row = (blockIdx.y * blockDim.y + threadIdx.y) / warpSize;
+    //int warp_col = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+	int warpID = tid >> 5;
+	
+	G0 = G + 64 * 64 * Block_X_Idx;
+	G1 = G0 + 64 * 64;
+
+	Y0 = Y + 64 * 4 * Block_X_Idx;
+	X0 = X + 64 * 4 * Block_X_Idx;
+	
+	int M = 64;
+	int N = 16;
+	int K = 64;
+		
+	int blockSize = blockDim.x * blockDim.y; // multple of 32s
+	float16_t *Gs_tr_0, *Ys_tr_0;
+	Gs_tr_0 = &smem_GXY.Gs[0][0];
+	Ys_tr_0 = &smem_GXY.Ys[0][0];
+	float16_t *Gs_tr_1, *Ys_tr_1;
+	Gs_tr_1 = &smem_GXY.Gs[16][0];
+	Ys_tr_1 = &smem_GXY.Ys[4][0];
+
+	
+	float *Xs;
+	Xs = &smem_GXY.Xs[0][0];
+	
+	float *Xs_1;
+	Xs_1 = &smem_GXY.Xs[4][0];
+	
+	// load Y0 to shared memory
+	int nElemPerThread = 64 * 4 * 2 / (blockSize * 4); // once 1 double
+	int nElemPerThread1 = 64 * 16 / (blockSize * 8); // once 1 float4
+
+	int sLoadIdx = tid * 4;
+	int YLoadIdx_0 = (tid > 63) * 16;
+	int YLoadIdx_1 = tid & 63;
+	
+	// 1st batch: transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		DOUBLE(smem_GXY.Ys[YLoadIdx_1][YLoadIdx_0]) = DOUBLE(Y0[sLoadIdx]);
+	
+		sLoadIdx += (blockSize * 4);
+		//YLoadIdx_0 += ((blockSize * 4) >> 2);
+	}
+
+
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[2];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[2];
+
+	// init accumulation
+    wmma::fill_fragment(c_frag[0], 0.0f);
+    wmma::fill_fragment(c_frag[1], 0.0f);
+
+	//__syncthreads();
+
+	//printf("tid: %d Ys: %f %f \n", tid, __half2float(smem_GXY.Ys[0][0]), __half2float(smem_GXY.Ys[4][0]));
+	
+	//__syncthreads();
+	
+	int GLoadIdx_0, GLoadIdx_1;
+	GLoadIdx_1 = tid >> 1; // 1 line 16 half == 2 float4, 2 threads
+	GLoadIdx_0 = (tid & 1) * 8;
+
+    // main loop
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) 
+	{
+		// load G0 to shared memory	
+		GLoadIdx_1 = tid >> 1;
+        for (i = 0; i < nElemPerThread1; i++)
+		{
+			//printf("GLoadIdx: %d %d \n", GLoadIdx_1, GLoadIdx_0);
+			
+			// first batch
+			FLOAT4(smem_GXY.Gs[GLoadIdx_1][GLoadIdx_0]) = FLOAT4(G0[GLoadIdx_1 * 64 + k_step + GLoadIdx_0]); // 64 x 32
+			// second batch
+			FLOAT4(smem_GXY.Gs[GLoadIdx_1][GLoadIdx_0 + 16]) = FLOAT4(G1[GLoadIdx_1 * 64 + k_step + GLoadIdx_0]);
+
+			
+			//sLoadIdx += blockSize;
+			GLoadIdx_1 += (blockSize >> 1);
+		}
+
+		__syncthreads();
+		
+		//printf("tid: %d k_step: %d Ys: %f %f \n", tid, k_step, __half2float(smem_GXY.Gs[0][0]), __half2float(smem_GXY.Gs[4][0]));
+	
+		//__syncthreads();
+		
+		// load data
+        wmma::load_matrix_sync(a_frag[0], Gs_tr_0 + warpID * WMMA_K * 32, 32); // 64 x 32
+        wmma::load_matrix_sync(a_frag[1], Gs_tr_0 + warpID * WMMA_K * 32 + 16, 32);
+
+        wmma::load_matrix_sync(b_frag[0], Ys_tr_0 + k_step * 32, 32); // 64 x 32
+        wmma::load_matrix_sync(b_frag[1], Ys_tr_0 + k_step * 32 + 16, 32);
+        
+        // multiplication excution
+        wmma::mma_sync(c_frag[0], a_frag[0], b_frag[0], c_frag[0]);
+        wmma::mma_sync(c_frag[1], a_frag[1], b_frag[1], c_frag[1]);
+	}
+
+	__syncthreads();
+
+    // result store
+    wmma::store_matrix_sync(Xs + warpID * 32 * WMMA_M, c_frag[0], 32, wmma::mem_row_major); // 64 x 32
+	wmma::store_matrix_sync(Xs + warpID * 32 * WMMA_M + 16, c_frag[1], 32, wmma::mem_row_major);
+ 
+	__syncthreads();
+
+	sLoadIdx = tid * 4;
+	YLoadIdx_0 = (tid > 63) * 16;
+	YLoadIdx_1 = tid & 63;
+	
+	// 1st batch: transpose
+	for (i = 0; i < nElemPerThread; i++)
+	{
+		FLOAT4(X0[sLoadIdx]) = FLOAT4(smem_GXY.Xs[YLoadIdx_1][YLoadIdx_0]); // 64 x 32
+	
+		sLoadIdx += (blockSize * 4);
+		//YLoadIdx_0 += ((blockSize * 4) >> 2);
+	}
+	
+	
+#if 0
+	__syncthreads();
+	if (tid == 0)
+	{
+
+
+		printf("#################################################\n");
+		for (i = 0; i < 64; i++)
+		{
+			for (j = 0; j < 32; j++)
+			{
+				printf("%f ", smem_GXY.Xs[i][j]);
+			}
+			
+			printf("\n");
+		}		
+	}
+	
+	__syncthreads();
+#endif
+	
+	
+	return;
+}
 
 int main(int argc, char **argv)
 {
     printf("> %s Starting...\n", argv[0]);
 	
     // set up data size of vectors
-    int nElem = 273 * 12 * 14;
+    int nElem =  273 * 12 * 14;
 	const int nElemPerMatrix = 4;
     printf("> vector size = %d\n", nElem);
 
@@ -1135,11 +1635,11 @@ int main(int argc, char **argv)
   	CHECK(cudaEventRecord(start, 0));
 	
 	dim3 block_wmma_c4 (128);
-    dim3 grid_wmma_c4  ((nElem + 3) / 4); // 4 elements in one block
+    dim3 grid_wmma_c4  ((nElem + 7) / 8); // 8 elements in one block
 
   	CHECK(cudaEventRecord(start, 0));
 
-    mimo64_wmma_block4_col_gpu_kernel<<<grid_wmma_c4, block_wmma_c4>>>(d_G16, d_Y16, d_X, nElem);
+    mimo64_wmma_block4_combine_gpu_kernel_v2<<<grid_wmma_c4, block_wmma_c4>>>(d_G16, d_Y16, d_X, nElem);
 
     CHECK(cudaEventRecord(stop, 0));
     CHECK(cudaEventSynchronize(stop));
@@ -1147,7 +1647,7 @@ int main(int argc, char **argv)
 
     CHECK(cudaMemcpy(X, d_X, nElem * 64 * sizeof(float), cudaMemcpyDeviceToHost));
 
-	printf("mimo64_wmma_naive4_col_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+	printf("mimo64_wmma_block4_combine_gpu_kernel_v2() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
 	checkResult(X_base, X, nElem * 64);	
 #endif
