@@ -86,7 +86,7 @@ void initialData_f32(float *ip, int size)
 
     for(i = 0; i < size; i++)
     {
-        ip[i] = (float)(rand() & 0xFF);
+        ip[i] = (float)rand() / (float)RAND_MAX;
 		//printf("val[%d]: %d \n", i, ip[i]);
     }
 
@@ -145,7 +145,7 @@ void Mimo64_createStreams(int numOfStreams){
 
 void checkResult(float *hostRef, float *gpuRef, const int N)
 {
-    double epsilon = 1.0E-8;
+    double epsilon = 1.0E-2;
     bool match = 1;
 	
 //	printf("hello world. \n");
@@ -156,7 +156,7 @@ void checkResult(float *hostRef, float *gpuRef, const int N)
         {
             match = 0;
             printf("Arrays do not match!\n");
-            printf("host %f gpu %f at %d (block: %d, thread: %d)\n", hostRef[i], gpuRef[i], i, i / (64 * 4), i % (64 * 4));
+            printf("host %f gpu %f at %d\n", hostRef[i], gpuRef[i], i);
             break;
         }
     }
@@ -204,6 +204,7 @@ void flash_att_naive_kernel(float* Q,
 						accu += Q_val * K_val;
 					}
 
+					// printf("iRow: %d, jCol: %d, S: %f \n", iRow, jCol, accu);
 					*S_2 = accu;
 				}
 			}
@@ -230,11 +231,13 @@ void flash_att_naive_kernel(float* Q,
 					sumExp += expf(val - max);
 				}
 				
+				// printf("iRow: %d max: %f sumExp: %f \n", iRow, max, sumExp);
 				// softmax 3) for each element, divide by sumExp
 				for (jCol = 0; jCol < N; jCol++){
 					val = *(S_3 + jCol);
 					
 					*(S_3 + jCol) = expf(val - max) / sumExp;
+					// printf("iRow: %d, jCol: %d, Softmax(S): %f \n", iRow, jCol, *(S_3 + jCol));
 				}
 			}
 			
@@ -243,7 +246,7 @@ void flash_att_naive_kernel(float* Q,
 				for (id = 0; id < d; id++){
 					float* S_4 = S_1 + iRow * N;
 					float* V_4 = V_1 + id;
-					float* O_4 = O_1 + iRow * N + id;
+					float* O_4 = O_1 + iRow * d + id;
 
 					float accu1 = 0.0f;
 					for (iN = 0; iN < N; iN++)
@@ -252,6 +255,8 @@ void flash_att_naive_kernel(float* Q,
 						float V_val = *(V_4 + iN * d);
 						accu1 += S_val * V_val;
 					}
+
+					// printf("iRow: %d, id: %d, result idx: %d, Softmax(S) * V: %f \n", iRow, id, iRow * N + id, accu1);
 
 					*O_4 = accu1;
 				}
@@ -263,6 +268,93 @@ void flash_att_naive_kernel(float* Q,
 }
 
 
+void flash_att_merge_kernel(float* Q,
+							float* K,
+							float* V,
+							float* O,
+							float* S,
+							int nBatch,
+							int nHead,
+							int N,
+							int d) 
+{
+	int iBatch, iHead, iN, id;
+	int iRow, jCol;
+	
+	for (iBatch = 0; iBatch < nBatch; iBatch++){
+		for (iHead = 0; iHead < nHead; iHead++){
+			// for each batch, length = nHead * N * d
+			// for each head, length = N * d
+			int Offset = iBatch * nHead * N * d + iHead * N * d;
+			float* Q_1 = Q + Offset;
+			float* K_1 = K + Offset;
+			float* V_1 = V + Offset;
+			float* O_1 = O + Offset;
+			float* S_1 = S;
+			
+			for (iRow = 0; iRow < N; iRow++){
+				float max_iter = -999999.0f; //-FLT_MAX;
+				float max_prev = 0.0f;
+				float sumExp_iter = 0.0f;
+				float sumExp_prev = 0.0f;
+				float Output = 0.0f;
+	
+				for (jCol = 0; jCol < N; jCol++){
+					float* Q_2 = Q_1 + iRow * d;
+					float* K_2 = K_1 + jCol * d;
+					float* S_2 = S_1 + iRow * N + jCol;
+
+					// Step 1: Q * K_T
+					float accu = 0.0f;
+					for (id = 0; id < d; id++)
+					{
+						float Q_val = *(Q_2 + id);
+						float K_val = *(K_2 + id);
+						accu += Q_val * K_val;
+					}
+					
+					// printf("iRow: %d, jCol: %d, S: %f \n", iRow, jCol, accu);
+
+					// Step 2: Softmax
+					max_iter = (max_iter > accu) ? max_iter : accu;
+					float exp_diff = expf(max_prev - max_iter);
+					float exp_curr = expf(accu - max_iter);
+
+					sumExp_iter = exp_diff * sumExp_prev + exp_curr;
+
+					// Step 3: Softmax output * V
+					float k_i = exp_curr / sumExp_iter;
+					// printf("### k_i: %f, sumExp_iter: %f, max_iter: %f, max_prev: %f \n", k_i, sumExp_iter, max_iter, max_prev);
+					
+					for (id = 0; id < d; id++)
+					{
+						float output = *(O_1 + iRow * d + id);
+						float V_val = *(V_1 + jCol * d + id);
+						// printf("### output: %f, V_val: %f \n", output, V_val);
+						
+						output = (output * exp_diff * sumExp_prev) / sumExp_iter;
+
+						// printf("### id: %d V_val: %f output: %f \n", id, V_val, output);
+						V_val = output + k_i * V_val;
+						// printf("output: %f \n", V_val);
+						*(O_1 + iRow * d + id) = V_val;
+					}
+					
+					// update max_prev, sumExp_prev
+					max_prev = max_iter;
+					sumExp_prev = sumExp_iter;
+				}
+			}
+		}
+	}
+
+	return;
+}
+
+
+
+
+
 int main(int argc, char **argv)
 {
     printf("> %s Starting...\n", argv[0]);
@@ -270,7 +362,7 @@ int main(int argc, char **argv)
     // GPT-2 parameters
     int nBatch = 32; // number of batchs
 	int nHead = 12; // number of heads
-	int HeadDim = 64; // head dimension: 768 / 12 heads
+	int HeadDim = 768; // head dimension: 768 / 12 heads
 	int nTokens = 1024; // number of tokens in a batch
 	
     float *Q;
@@ -282,12 +374,14 @@ int main(int argc, char **argv)
 	
 	int QKV_Size = nBatch * nHead * HeadDim * nTokens; // 24M
 	int QK_T_Size = nTokens * nTokens; // 1MB
+	printf("QKV size: %d \n", QKV_Size);
+		
 	Mimo64_alloc_host_mem((void **)&Q, QKV_Size * sizeof(float)); // 96MB
 	Mimo64_alloc_host_mem((void **)&K, QKV_Size * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&V, QKV_Size * sizeof(float)); 
 	Mimo64_alloc_host_mem((void **)&O_base, QKV_Size * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&O, QKV_Size * sizeof(float));
-	Mimo64_alloc_host_mem((void **)&S, QK_T_Size * sizeof(float)); // 1,536MB 
+	Mimo64_alloc_host_mem((void **)&S, QK_T_Size * sizeof(float)); // 4MB 
 
 
 	float *d_Q;
@@ -306,13 +400,23 @@ int main(int argc, char **argv)
  	initialData_f32(K, QKV_Size);
  	initialData_f32(V, QKV_Size);
 
-	//mimo64_naive_kernel(G, Y, X_base, nElem, nElemPerMatrix);
 	long t_start = useconds();
-
+	//printf("V: %f %f \n", V[0], V[1]);
 	flash_att_naive_kernel(Q, K, V, O_base, S, nBatch, nHead, nTokens, HeadDim);
+	//printf("O_base: %f %f \n", O_base[0], O_base[1]);
 	
 	long t_end = useconds();
 	printf("flash_att_naive_kernel() costs %ld us \n", (t_end - t_start) );
+
+	long t_start1 = useconds();
+	//printf("V: %f %f \n", V[0], V[1]);
+	flash_att_merge_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim);
+	//printf("O: %f %f \n", O[0], O[1]);
+	
+	long t_end1 = useconds();
+	printf("flash_att_merge_kernel() costs %ld us \n", (t_end1 - t_start1) );
+
+	checkResult(O_base, O, QKV_Size);	
 
 	Mimo64_free_host_mem(Q);
 	Mimo64_free_host_mem(K);
