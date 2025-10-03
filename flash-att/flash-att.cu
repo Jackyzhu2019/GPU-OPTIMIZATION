@@ -11,7 +11,7 @@
 #define FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
 #define float16_t half
-
+//#define printf(...);
 
 void Mimo64_alloc_host_mem(void** host_ptr_addr, size_t size)
 {
@@ -313,8 +313,6 @@ void flash_att_merge_kernel(float* Q,
 						accu += Q_val * K_val;
 					}
 					
-					// printf("iRow: %d, jCol: %d, S: %f \n", iRow, jCol, accu);
-
 					// Step 2: Softmax
 					max_iter = (max_iter > accu) ? max_iter : accu;
 					float exp_diff = expf(max_prev - max_iter);
@@ -324,19 +322,15 @@ void flash_att_merge_kernel(float* Q,
 
 					// Step 3: Softmax output * V
 					float k_i = exp_curr / sumExp_iter;
-					// printf("### k_i: %f, sumExp_iter: %f, max_iter: %f, max_prev: %f \n", k_i, sumExp_iter, max_iter, max_prev);
 					
 					for (id = 0; id < d; id++)
 					{
 						float output = *(O_1 + iRow * d + id);
 						float V_val = *(V_1 + jCol * d + id);
-						// printf("### output: %f, V_val: %f \n", output, V_val);
 						
 						output = (output * exp_diff * sumExp_prev) / sumExp_iter;
 
-						// printf("### id: %d V_val: %f output: %f \n", id, V_val, output);
 						V_val = output + k_i * V_val;
-						// printf("output: %f \n", V_val);
 						*(O_1 + iRow * d + id) = V_val;
 					}
 					
@@ -351,7 +345,136 @@ void flash_att_merge_kernel(float* Q,
 	return;
 }
 
+void flash_att_merge_block_kernel(float* Q,
+							float* K,
+							float* V,
+							float* O,
+							float* S,
+							int nBatch,
+							int nHead,
+							int N,
+							int d,
+							int Br,
+							int Bc)
+{
+	int iBatch, iHead, iN, id;
+	int iRow, jCol;
+	const int Tc = N / Bc;
+	const int Tr = N / Br;
+	int i, j;
+	float S_ij[Br][Bc]; // used to store block tile Q * K_T
+	float max_S[Br]; // used to store max value of each row in block tile
+	float l_expsum[Br]; // used to store exp sum value of each row in block tile
+	float O_ij[Br][d]; // used to store the output per block
 
+
+	for (iBatch = 0; iBatch < nBatch; iBatch++){
+		for (iHead = 0; iHead < nHead; iHead++){
+			// for each batch, length = nHead * N * d
+			// for each head, length = N * d
+			int Offset = iBatch * nHead * N * d + iHead * N * d;
+			float* Q_0 = Q + Offset;
+			float* K_0 = K + Offset;
+			float* V_0 = V + Offset;
+			float* O_0 = O + Offset;
+			float* S_0 = S;
+			
+			// Initialization
+			memset(&S_ij[0][0], 0.0, Br * Bc * sizeof(float));
+	
+			
+			for (i = 0; i < Tr; i++){
+				float* Q_1 = Q_0 + i * Br * d;
+				float* O_1 = O_0 + i * Br * d;
+
+				float* S_1 = S;
+				
+				memset(&l_expsum[0], 0.0, Br * sizeof(float));
+
+				for (int iMax = 0; iMax < Br; iMax++){
+					max_S[iMax] = -999999.0f;
+				}
+				
+				for (j = 0; j < Tc; j++){
+					float* K_1 = K_0 + j * Bc * d;
+					float* V_1 = V_0 + j * Bc * d;
+
+
+					memset(&O_ij[0][0], 0.0, Br * d * sizeof(float));
+
+
+					for (iRow = 0; iRow < Br; iRow++){
+						float max_iter = -999999.0f; //-FLT_MAX;
+						float max_prev = max_S[iRow];
+						float sumExp_iter = 0.0f;
+						float sumExp_prev = l_expsum[iRow];
+						float Output = 0.0f;
+						
+						for (jCol = 0; jCol < Bc; jCol++){
+							float* Q_2 = Q_1 + iRow * d;
+							float* K_2 = K_1 + jCol * d;
+							float* S_2 = S_1 + iRow * N + jCol;
+
+							// Step 1: Q * K_T
+							float accu = 0.0f;
+							for (id = 0; id < d; id++)
+							{
+								float Q_val = *(Q_2 + id);
+								float K_val = *(K_2 + id);
+								accu += Q_val * K_val;
+							}
+							
+							max_iter = (max_iter > accu) ? max_iter : accu;
+							S_ij[iRow][jCol] = accu;
+						}
+						
+						float exp_curr = 0.0f;
+						max_iter = (max_iter > max_prev) ? max_iter : max_prev;
+						for (jCol = 0; jCol < Bc; jCol++){
+							// Step 2: sum exp per block
+							S_ij[iRow][jCol] = expf(S_ij[iRow][jCol] - max_iter);
+							exp_curr += S_ij[iRow][jCol];
+						}
+							
+						float exp_diff = expf(max_prev - max_iter);
+						
+						sumExp_iter = exp_diff * sumExp_prev + exp_curr;
+							
+					
+						for (jCol = 0; jCol < Bc; jCol++){
+							// Step 3: Softmax output * V for the current block
+							float k_i = S_ij[iRow][jCol] / sumExp_iter;
+
+							for (id = 0; id < d; id++)
+							{
+								float V_val = *(V_1 + jCol * d + id);
+								
+								O_ij[iRow][id] += k_i * V_val;
+							}					
+						}
+						
+						// Step 4: add result of current block to final output	
+						for (id = 0; id < d; id++)
+						{
+							float output = *(O_1 + iRow * d + id);							
+							float temp = (output * exp_diff * sumExp_prev) / sumExp_iter;
+
+							output = temp + O_ij[iRow][id];
+							 
+							*(O_1 + iRow * d + id) = output;
+						}					
+						
+						// update max_prev, sumExp_prev
+						max_S[iRow] = max_iter;
+						l_expsum[iRow] = sumExp_iter;
+					}
+				}
+			}
+		}
+	}
+
+	return;
+}
 
 
 
@@ -362,7 +485,7 @@ int main(int argc, char **argv)
     // GPT-2 parameters
     int nBatch = 32; // number of batchs
 	int nHead = 12; // number of heads
-	int HeadDim = 768; // head dimension: 768 / 12 heads
+	int HeadDim = 64; // head dimension: 768 / 12 heads
 	int nTokens = 1024; // number of tokens in a batch
 	
     float *Q;
@@ -417,6 +540,19 @@ int main(int argc, char **argv)
 	printf("flash_att_merge_kernel() costs %ld us \n", (t_end1 - t_start1) );
 
 	checkResult(O_base, O, QKV_Size);	
+
+
+    memset(O, 0, QKV_Size * sizeof(float));
+	long t_start2 = useconds();
+	//printf("V: %f %f \n", V[0], V[1]);
+	flash_att_merge_block_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim, 128, 64);
+	//printf("O: %f %f \n", O[0], O[1]);
+	
+	long t_end2 = useconds();
+	printf("flash_att_merge_block_kernel() costs %ld us \n", (t_end2 - t_start2) );
+
+	checkResult(O_base, O, QKV_Size);
+
 
 	Mimo64_free_host_mem(Q);
 	Mimo64_free_host_mem(K);
