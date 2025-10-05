@@ -394,14 +394,13 @@ void flash_att_merge_block_kernel(float* Q,
 				for (int iMax = 0; iMax < Br; iMax++){
 					max_S[iMax] = -999999.0f;
 				}
+
+				memset(&O_ij[0][0], 0.0, Br * d * sizeof(float));
+
 				
 				for (j = 0; j < Tc; j++){
 					float* K_1 = K_0 + j * Bc * d;
 					float* V_1 = V_0 + j * Bc * d;
-
-
-					memset(&O_ij[0][0], 0.0, Br * d * sizeof(float));
-
 
 					for (iRow = 0; iRow < Br; iRow++){
 						float max_iter = -999999.0f; //-FLT_MAX;
@@ -440,35 +439,38 @@ void flash_att_merge_block_kernel(float* Q,
 						
 						sumExp_iter = exp_diff * sumExp_prev + exp_curr;
 							
-					
-						for (jCol = 0; jCol < Bc; jCol++){
-							// Step 3: Softmax output * V for the current block
-							float k_i = S_ij[iRow][jCol] / sumExp_iter;
-
-							for (id = 0; id < d; id++)
-							{
-								float V_val = *(V_1 + jCol * d + id);
-								
-								O_ij[iRow][id] += k_i * V_val;
-							}					
-						}
-						
-						// Step 4: add result of current block to final output	
 						for (id = 0; id < d; id++)
 						{
-							float output = *(O_1 + iRow * d + id);							
+							float output = O_ij[iRow][id];							
 							float temp = (output * exp_diff * sumExp_prev) / sumExp_iter;
-
-							output = temp + O_ij[iRow][id];
-							 
-							*(O_1 + iRow * d + id) = output;
-						}					
+							float sum0 = 0.0f;
+							
+							for (jCol = 0; jCol < Bc; jCol++){
+							// Step 3: Softmax output * V for the current block
+								float k_i = S_ij[iRow][jCol] / sumExp_iter;
+								float V_val = *(V_1 + jCol * d + id);
+								
+								sum0 += k_i * V_val;
+								
+							}
+							
+							O_ij[iRow][id] = temp + sum0;;						
+						}
 						
 						// update max_prev, sumExp_prev
 						max_S[iRow] = max_iter;
 						l_expsum[iRow] = sumExp_iter;
 					}
 				}
+				
+				
+				for (iRow = 0; iRow < Br; iRow++){
+					for (id = 0; id < d; id++)
+					{						 
+						*(O_1 + iRow * d + id) = O_ij[iRow][id];
+					}	
+				}
+				
 			}
 		}
 	}
@@ -483,8 +485,8 @@ int main(int argc, char **argv)
     printf("> %s Starting...\n", argv[0]);
 	
     // GPT-2 parameters
-    int nBatch = 32; // number of batchs
-	int nHead = 12; // number of heads
+    int nBatch = 1; // number of batchs
+	int nHead = 1; // number of heads
 	int HeadDim = 64; // head dimension: 768 / 12 heads
 	int nTokens = 1024; // number of tokens in a batch
 	
@@ -545,7 +547,7 @@ int main(int argc, char **argv)
     memset(O, 0, QKV_Size * sizeof(float));
 	long t_start2 = useconds();
 	//printf("V: %f %f \n", V[0], V[1]);
-	flash_att_merge_block_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim, 128, 64);
+	flash_att_merge_block_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim, 64, 128);
 	//printf("O: %f %f \n", O[0], O[1]);
 	
 	long t_end2 = useconds();
