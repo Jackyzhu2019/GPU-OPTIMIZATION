@@ -394,13 +394,16 @@ void flash_att_merge_block_kernel(float* Q,
 				for (int iMax = 0; iMax < Br; iMax++){
 					max_S[iMax] = -999999.0f;
 				}
-
+#if 0
 				memset(&O_ij[0][0], 0.0, Br * d * sizeof(float));
-
+#endif
 				
 				for (j = 0; j < Tc; j++){
 					float* K_1 = K_0 + j * Bc * d;
 					float* V_1 = V_0 + j * Bc * d;
+#if 1
+					memset(&O_ij[0][0], 0.0, Br * d * sizeof(float));
+#endif
 
 					for (iRow = 0; iRow < Br; iRow++){
 						float max_iter = -999999.0f; //-FLT_MAX;
@@ -438,7 +441,8 @@ void flash_att_merge_block_kernel(float* Q,
 						float exp_diff = expf(max_prev - max_iter);
 						
 						sumExp_iter = exp_diff * sumExp_prev + exp_curr;
-							
+
+#if 0							
 						for (id = 0; id < d; id++)
 						{
 							float output = O_ij[iRow][id];							
@@ -456,21 +460,45 @@ void flash_att_merge_block_kernel(float* Q,
 							
 							O_ij[iRow][id] = temp + sum0;					
 						}
+#else
+						for (jCol = 0; jCol < Bc; jCol++){
+							// Step 3: Softmax output * V for the current block
+							float k_i = S_ij[iRow][jCol] / sumExp_iter;
+
+							for (id = 0; id < d; id++)
+							{
+								float V_val = *(V_1 + jCol * d + id);
+								
+								O_ij[iRow][id] += k_i * V_val;
+							}					
+						}
 						
+						// Step 4: add result of current block to final output	
+						for (id = 0; id < d; id++)
+						{
+							float output = *(O_1 + iRow * d + id);							
+							float temp = (output * exp_diff * sumExp_prev) / sumExp_iter;
+
+							output = temp + O_ij[iRow][id];
+							 
+							*(O_1 + iRow * d + id) = output;
+						}
+#endif
 						// update max_prev, sumExp_prev
 						max_S[iRow] = max_iter;
 						l_expsum[iRow] = sumExp_iter;
+
 					}
 				}
 				
-				
+#if 0
 				for (iRow = 0; iRow < Br; iRow++){
 					for (id = 0; id < d; id++)
 					{						 
 						*(O_1 + iRow * d + id) = O_ij[iRow][id];
 					}	
 				}
-				
+#endif
 			}
 		}
 	}
