@@ -690,8 +690,8 @@ int main(int argc, char **argv)
     printf("> %s Starting...\n", argv[0]);
 	
     // GPT-2 parameters
-    int nBatch = 1; // number of batchs
-	int nHead = 1; // number of heads
+    int nBatch = 32; // number of batchs
+	int nHead = 12; // number of heads
 	int HeadDim = 64; // head dimension: 768 / 12 heads
 	int nTokens = 1024; // number of tokens in a batch
 	
@@ -788,7 +788,7 @@ int main(int argc, char **argv)
 	if (max_sram_size < sram_size)
 		printf("Your request memory is larger than system volume, please input another Br/Bc combination! \n");
 		
-	int block_x = 128;
+	int block_x = 512;
 	int block_y = 1;
 	
 	int numThreads = block_x * block_y;
