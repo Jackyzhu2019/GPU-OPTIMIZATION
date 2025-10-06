@@ -784,10 +784,13 @@ int main(int argc, char **argv)
     int max_sram_size;
     cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
     printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+	
+	int skipKernel = 0;
 
-	if (max_sram_size < sram_size)
+	if (max_sram_size < sram_size){
+		skipKernel = 1;
 		printf("Your request memory is larger than system volume, please input another Br/Bc combination! \n");
-		
+	}
 	int block_x = 512;
 	int block_y = 1;
 	
@@ -797,34 +800,39 @@ int main(int argc, char **argv)
 	int align2 = Bc * Br;
 		
 	if (align0 % numThreads != 0){
+		skipKernel = 1;
 		printf("Num of Threads must align with Bc * HeadDim \n");
 	}		
 		
 	if (align1 % numThreads != 0){
+		skipKernel = 1;
 		printf("Num of Threads must align with Br * HeadDim \n");
 	}		
 
 	if (align2 % numThreads != 0){
+		skipKernel = 1;
 		printf("Num of Threads must align with Bc * Br \n");
 	}
 
-	dim3 grid(nHead, nBatch);
-    dim3 block(block_x, block_y);
+	if (skipKernel == 0){
+		dim3 grid(nHead, nBatch);
+		dim3 block(block_x, block_y);
 
-  	CHECK(cudaEventRecord(start, 0));
+		CHECK(cudaEventRecord(start, 0));
 
-	flash_att_merge_block_gpu_kernel<<<grid, block, sram_size>>>(d_Q, d_K, d_V, d_O, nTokens, HeadDim, Br, Bc);
+		flash_att_merge_block_gpu_kernel<<<grid, block, sram_size>>>(d_Q, d_K, d_V, d_O, nTokens, HeadDim, Br, Bc);
 
-    CHECK(cudaEventRecord(stop, 0));
-    CHECK(cudaEventSynchronize(stop));
-    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+		CHECK(cudaEventRecord(stop, 0));
+		CHECK(cudaEventSynchronize(stop));
+		CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
 
-    CHECK(cudaMemcpy(O, d_O, QKV_Size * sizeof(float), cudaMemcpyDeviceToHost));
+		CHECK(cudaMemcpy(O, d_O, QKV_Size * sizeof(float), cudaMemcpyDeviceToHost));
 
-	printf("flash_att_merge_block_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+		printf("flash_att_merge_block_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
 
-	checkResult(O_base, O, QKV_Size);	
-
+		checkResult(O_base, O, QKV_Size);	
+	}
+	
 #endif
 
 	Mimo64_free_host_mem(Q);
