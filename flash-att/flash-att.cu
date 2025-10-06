@@ -759,8 +759,8 @@ int main(int argc, char **argv)
  	initialData_f32(K, QKV_Size);
  	initialData_f32(V, QKV_Size);
 	
-	int Br = 16;
-	int Bc = 32;
+	int Br = 32;
+	int Bc = 16;
 
 #if 1
 	long t_start = useconds();
