@@ -422,7 +422,7 @@ void flash_att_merge_block_kernel(float* Q,
 								float K_val = *(K_2 + id);
 								accu += Q_val * K_val;
 							}
-							
+										
 							max_iter = (max_iter > accu) ? max_iter : accu;
 							S_ij[iRow][jCol] = accu;
 						}
@@ -454,7 +454,7 @@ void flash_att_merge_block_kernel(float* Q,
 								
 							}
 							
-							O_ij[iRow][id] = temp + sum0;;						
+							O_ij[iRow][id] = temp + sum0;					
 						}
 						
 						// update max_prev, sumExp_prev
@@ -478,6 +478,211 @@ void flash_att_merge_block_kernel(float* Q,
 	return;
 }
 
+__global__ void flash_att_merge_block_gpu_kernel(float* Q,
+												float* K,
+												float* V,
+												float* O,
+												int N,
+												int d,
+												int Br,
+												int Bc)
+{
+	int i, j, k;
+	int iRow, jCol, id;
+
+	// inside a block
+	int xIdx = threadIdx.x;
+	int yIdx = threadIdx.y;
+	// block shape
+	int xLen = blockDim.x;
+	int yLen = blockDim.y;
+	// block index
+	int Block_X_Idx = blockIdx.x;
+	int Block_Y_Idx = blockIdx.y; // 0
+	
+	int tid_x = yIdx * xLen + xIdx;
+	//int tid_y = xIdx * yLen + yIdx;
+	
+	// printf("xIdx: %d yIdx: %d xLen: %d yLen: %d tid_x: %d \n", xIdx, yIdx, xLen, yLen, tid_x);
+	
+	const int Tc = N / Bc;
+	const int Tr = N / Br;
+
+	int BlockSize = xLen * yLen;
+	
+	extern __shared__ float sram[];
+
+	// shared memory
+	float *sQ = sram; // shared memory of Q: Br * d * 4
+	float *O_ij = sQ + Br * d; // shared memory, used to store the output per block： br * d
+	
+	float *sK = O_ij + Br * d; // shared memory of K: Bc * d * 4
+	float *sV = sK + Bc * d; // shared memory of V: Bc * d * 4
+	float *S_ij = sV + Bc * d; // shared memory, used to store block tile Q * K_T: br x bc
+
+	float *max_S = S_ij + Br * Bc;  // shared memory, used to store max value of each row in block tile: Br
+	float *l_expsum = max_S + Br; // shared memory, used to store exp sum value of each row in block tile: Br
+
+	int numQ_perThread = Br * d / BlockSize;
+	int numKV_perThread = Bc * d / BlockSize;
+	int numS_perThread = Bc * Br / BlockSize;
+	int iData;
+	//printf("Bc: %d, Br: %d, BlockSize: %d, numS_perThread: %d \n", Bc, Br, BlockSize, numS_perThread);
+
+	int iHead = blockIdx.x;
+	int iBatch = blockIdx.y;
+	int nHead = gridDim.x;
+	int nBatch = gridDim.y;
+	
+	//printf("tidx: %d iHead: %d, iBatch: %d, nHead: %d, nBatch: %d \n", tid_x, iHead, iBatch, nHead, nBatch);
+	int Offset = iBatch * nHead * N * d + iHead * N * d;
+	float* Q_0 = Q + Offset;
+	float* K_0 = K + Offset;
+	float* V_0 = V + Offset;
+	float* O_0 = O + Offset;
+	float sumExp_iter;
+
+#if 1
+	for (i = 0; i < Tr; i++){
+		// Initialization
+		if (tid_x < Br){
+			l_expsum[tid_x] = 0.0f;
+			max_S[tid_x] = -999999.0f;
+		}
+
+		for (iData = 0; iData < numQ_perThread; iData++){
+			int threadStep = iData * BlockSize;
+			
+			O_ij[tid_x + threadStep] = 0.0f;
+		}
+		
+		// load sQ
+		int blockTileTr = Br * d * i;
+
+		for (iData = 0; iData < numQ_perThread; iData++){
+			int threadStep = iData * BlockSize;
+			
+			sQ[tid_x + threadStep] = *(Q_0 + tid_x + threadStep + blockTileTr);
+		}
+
+		//printf("tid_x: %d, Tc: %d, Tr: %d numS_perThread: %d \n", tid_x, Tc, Tr, numS_perThread);
+		for (j = 0; j < Tc; j++){
+			// load sK, sV
+			int blockTileTc = Bc * d * j;
+			for (iData = 0; iData < numKV_perThread; iData++){
+				int threadStep = iData * BlockSize;
+				
+				sK[tid_x + threadStep] = *(K_0 + tid_x + threadStep + blockTileTc);
+			}
+			
+			for (iData = 0; iData < numKV_perThread; iData++){
+				int threadStep = iData * BlockSize;
+				
+				sV[tid_x + threadStep] = *(V_0 + tid_x + threadStep + blockTileTc);
+			}
+			
+			__syncthreads();
+			
+			int S_idx;
+			for (S_idx = 0; S_idx < numS_perThread; S_idx++)
+			{
+				// index (iRow, jCol) inside S_ij (Q * K_T output) to be calculated in current thread.
+				iRow = (S_idx * BlockSize + tid_x) / Bc;
+				jCol = (S_idx * BlockSize + tid_x) % Bc;
+							
+				float* Q_2 = sQ + iRow * d;
+				float* K_2 = sK + jCol * d;
+
+				// Step 1: Q * K_T
+				float accu = 0.0f;
+				for (id = 0; id < d; id++)
+				{
+					float Q_val = *(Q_2 + id);
+					float K_val = *(K_2 + id);
+					accu += Q_val * K_val;
+				}
+				
+				//if (tid_x <= 1 && S_idx == 0 && i == 0){
+				//	printf("tid_x: %d j: %d S_idx: %d accu: %f r/c: %d %d Q/K: %f %f \n", tid_x, j, S_idx, accu, iRow, jCol, *Q_2, *K_2);
+				// }
+				S_ij[iRow * Bc + jCol] = accu;
+			}
+			
+			__syncthreads();
+			
+			if (tid_x < Br){
+				float max_iter = -999999.0f; //-FLT_MAX;
+				float exp_curr = 0.0f;
+				float max_prev = max_S[tid_x];
+				float sumExp_prev = l_expsum[tid_x];
+
+				for (jCol = 0; jCol < Bc; jCol++){
+				// Step 2a: find max per row in the block br x bc
+					float accu = S_ij[tid_x * Bc + jCol];
+					max_iter = (max_iter > accu) ? max_iter : accu;
+				}
+				
+				max_iter = (max_iter > max_prev) ? max_iter : max_prev;
+
+				for (jCol = 0; jCol < Bc; jCol++){
+				// Step 2b: sum exp per row in the block br x bc
+					S_ij[tid_x * Bc + jCol] = __expf(S_ij[tid_x * Bc + jCol] - max_iter);
+					exp_curr += S_ij[tid_x * Bc + jCol];
+				}
+
+				float exp_diff = __expf(max_prev - max_iter);
+				sumExp_iter = exp_diff * sumExp_prev + exp_curr;
+				
+				// update O_ij
+				for (id = 0; id < d; id++){
+					float output = O_ij[tid_x * d + id];							
+					O_ij[tid_x * d + id] = (output * exp_diff * sumExp_prev) / sumExp_iter;
+				}
+				
+				// update max_prev, sumExp_prev
+				max_S[tid_x] = max_iter;
+				l_expsum[tid_x] = sumExp_iter;
+			}
+			
+			__syncthreads();
+
+			int O_idx;
+			for (O_idx = 0; O_idx < numQ_perThread; O_idx++)
+			{
+				// index (iRow, id) inside output (P * V output {Br x d} ) to be calculated in current thread.
+				iRow = (O_idx * BlockSize + tid_x) / d;
+				id = (O_idx * BlockSize + tid_x) % d;
+				float sum0 = 0.0f;
+
+				// Step 3: Softmax output * V of the current block for the current thread
+				for (int iO = 0; iO < Bc; iO++){
+					float V_val = *(sV + iO * d + id);
+					float k_i = S_ij[iRow * Bc + iO] / l_expsum[iRow];
+
+					sum0 += k_i * V_val;
+				}
+				
+			
+				O_ij[iRow * d + id] += sum0;						
+			}
+			
+			__syncthreads();
+		}
+
+		
+		// load O_ij to the final reuslt O
+		for (iData = 0; iData < numQ_perThread; iData++){
+			int threadStep = iData * BlockSize;
+			
+			*(O_0 + tid_x + threadStep + blockTileTr) = O_ij[tid_x + threadStep];
+		}
+		
+		__syncthreads();
+	}
+#endif	
+
+	return;
+}
 
 
 int main(int argc, char **argv)
@@ -517,6 +722,7 @@ int main(int argc, char **argv)
 	Mimo64_alloc_device_mem((void **)&d_Q, QKV_Size * sizeof(float));
 	Mimo64_alloc_device_mem((void **)&d_K, QKV_Size * sizeof(float));
 	Mimo64_alloc_device_mem((void **)&d_V, QKV_Size * sizeof(float));
+	Mimo64_alloc_device_mem((void **)&d_O, QKV_Size * sizeof(float));
 
     memset(O, 0, QKV_Size * sizeof(float));
     memset(O_base,  0, QKV_Size * sizeof(float));
@@ -524,7 +730,11 @@ int main(int argc, char **argv)
  	initialData_f32(Q, QKV_Size);
  	initialData_f32(K, QKV_Size);
  	initialData_f32(V, QKV_Size);
+	
+	int Br = 16;
+	int Bc = 32;
 
+#if 1
 	long t_start = useconds();
 	//printf("V: %f %f \n", V[0], V[1]);
 	flash_att_naive_kernel(Q, K, V, O_base, S, nBatch, nHead, nTokens, HeadDim);
@@ -532,7 +742,9 @@ int main(int argc, char **argv)
 	
 	long t_end = useconds();
 	printf("flash_att_naive_kernel() costs %ld us \n", (t_end - t_start) );
+#endif
 
+#if 1
 	long t_start1 = useconds();
 	//printf("V: %f %f \n", V[0], V[1]);
 	flash_att_merge_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim);
@@ -543,18 +755,77 @@ int main(int argc, char **argv)
 
 	checkResult(O_base, O, QKV_Size);	
 
-
     memset(O, 0, QKV_Size * sizeof(float));
 	long t_start2 = useconds();
 	//printf("V: %f %f \n", V[0], V[1]);
-	flash_att_merge_block_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim, 64, 128);
+	flash_att_merge_block_kernel(Q, K, V, O, S, nBatch, nHead, nTokens, HeadDim, Br, Bc);
 	//printf("O: %f %f \n", O[0], O[1]);
 	
 	long t_end2 = useconds();
 	printf("flash_att_merge_block_kernel() costs %ld us \n", (t_end2 - t_start2) );
 
 	checkResult(O_base, O, QKV_Size);
+#endif
 
+#if 1
+	float kernel_time;
+    cudaEvent_t start, stop;
+    CHECK(cudaEventCreate(&start));
+    CHECK(cudaEventCreate(&stop));
+
+	CHECK(cudaMemcpy(d_Q, Q, QKV_Size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_K, K, QKV_Size * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_V, V, QKV_Size * sizeof(float), cudaMemcpyHostToDevice));
+    
+	// Calculate SRAM size needed per block
+    const int sram_size = (2 * Bc * HeadDim * sizeof(float)) + (2 * Br * HeadDim * sizeof(float)) 
+						+ (Bc * Br * sizeof(float)) + (2 * Br * HeadDim * sizeof(float));
+						
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+
+	if (max_sram_size < sram_size)
+		printf("Your request memory is larger than system volume, please input another Br/Bc combination! \n");
+		
+	int block_x = 128;
+	int block_y = 1;
+	
+	int numThreads = block_x * block_y;
+	int align0 = Bc * HeadDim;
+	int align1 = Br * HeadDim;
+	int align2 = Bc * Br;
+		
+	if (align0 % numThreads != 0){
+		printf("Num of Threads must align with Bc * HeadDim \n");
+	}		
+		
+	if (align1 % numThreads != 0){
+		printf("Num of Threads must align with Br * HeadDim \n");
+	}		
+
+	if (align2 % numThreads != 0){
+		printf("Num of Threads must align with Bc * Br \n");
+	}
+
+	dim3 grid(nHead, nBatch);
+    dim3 block(block_x, block_y);
+
+  	CHECK(cudaEventRecord(start, 0));
+
+	flash_att_merge_block_gpu_kernel<<<grid, block, sram_size>>>(d_Q, d_K, d_V, d_O, nTokens, HeadDim, Br, Bc);
+
+    CHECK(cudaEventRecord(stop, 0));
+    CHECK(cudaEventSynchronize(stop));
+    CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+
+    CHECK(cudaMemcpy(O, d_O, QKV_Size * sizeof(float), cudaMemcpyDeviceToHost));
+
+	printf("flash_att_merge_block_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+
+	checkResult(O_base, O, QKV_Size);	
+
+#endif
 
 	Mimo64_free_host_mem(Q);
 	Mimo64_free_host_mem(K);
@@ -565,6 +836,7 @@ int main(int argc, char **argv)
 	Mimo64_free_device_mem(d_Q);
 	Mimo64_free_device_mem(d_K);
 	Mimo64_free_device_mem(d_V);
-	
+	Mimo64_free_device_mem(d_O);
+
 	return 0;
 }
