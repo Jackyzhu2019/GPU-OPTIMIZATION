@@ -12,6 +12,7 @@
 
 #define float16_t half
 //#define printf(...);
+#define IM2COL_BERVER 0
 
 void Mimo64_alloc_host_mem(void** host_ptr_addr, size_t size)
 {
@@ -152,6 +153,7 @@ void checkResult(float *hostRef, float *gpuRef, const int N)
 //		printf("host: %f gpu: %f \n", hostRef[0], gpuRef[0]);
     for (int i = 0; i < N; i++)
     {
+		//printf("i: %d host: %f gpu: %f \n", i, hostRef[i], gpuRef[i]);
         if (abs(hostRef[i] - gpuRef[i]) > epsilon)
         {
             match = 0;
@@ -280,12 +282,12 @@ void conv_naive_kernel(
  * 
  */
 void im2col(
-	const float* input, 
+	const float* input,
 	float* data_col,
-	int channels, 
-	int height, 
+	int channels,
+	int height,
 	int width,
-	int kernel_h, 
+	int kernel_h,
 	int kernel_w,
 	int pad_h, 
 	int pad_w,
@@ -299,6 +301,8 @@ void im2col(
     int col_rows = channels * kernel_h * kernel_w;
     int col_cols = out_h * out_w;
     
+	//printf("col_rows: %d, col_cols: %d \n", col_rows, col_cols);
+	
 	// loop every element in output col matrix
 	for (int oh = 0; oh < out_h; oh++) {
 		for (int ow = 0; ow < out_w; ow++) {
@@ -385,7 +389,45 @@ void matmul_add_bias(
     }
 }
 
+#if IM2COL_BERVER == 1    
+float im2col_get_pixel(float *im, int height, int width, int channels,
+                        int row, int col, int channel, int pad)
+{
+    row -= pad;
+    col -= pad;
 
+    if (row < 0 || col < 0 ||
+        row >= height || col >= width) return 0;
+    return im[col + width*(row + height*channel)];
+}
+
+//From Berkeley Vision's Caffe!
+//https://github.com/BVLC/caffe/blob/master/LICENSE
+void im2col_cpu(float* data_im,
+     int channels,  int height,  int width,
+     int ksize,  int stride, int pad, float* data_col) 
+{
+    int c,h,w;
+    int height_col = (height + 2*pad - ksize) / stride + 1;
+    int width_col = (width + 2*pad - ksize) / stride + 1;
+
+    int channels_col = channels * ksize * ksize;
+    for (c = 0; c < channels_col; ++c) {
+        int w_offset = c % ksize;
+        int h_offset = (c / ksize) % ksize;
+        int c_im = c / ksize / ksize;
+        for (h = 0; h < height_col; ++h) {
+            for (w = 0; w < width_col; ++w) {
+                int im_row = h_offset + h * stride;
+                int im_col = w_offset + w * stride;
+                int col_index = (c * height_col + h) * width_col + w;
+                data_col[col_index] = im2col_get_pixel(data_im, height, width, channels,
+                        im_row, im_col, c_im, pad);
+            }
+        }
+    }
+}
+#endif
 
 void conv_im2col_kernel(	
 	float *input,      // input image: [batch_size][in_channels][height][width]
@@ -425,9 +467,14 @@ void conv_im2col_kernel(
 		float *data_col_batch = data_col + numColMatrixperBatch * iBatch; // actually we can use one batch for intermediate use
 		float *output_batch = output + numElePerOutBatch * iBatch;
 		
+#if IM2COL_BERVER == 1    
+		im2col_cpu(input_batch, in_channels,  height,  width, kernel_h,
+					stride_h, padding_h, data_col_batch);
+#else 
 		im2col(input_batch, data_col_batch, in_channels, height, width,
-           kernel_h, kernel_w, padding_h, padding_w, stride_h, stride_w);
-    
+			kernel_h, kernel_w, padding_h, padding_w, stride_h, stride_w);
+#endif	
+	
 		matmul_add_bias(data_col_batch, kernel, bias, output_batch, 
                     out_channels, col_rows, col_cols, out_h, out_w);
  
@@ -436,31 +483,192 @@ void conv_im2col_kernel(
 	return;
 }
 
+__constant__ float d_kernel_const[32 * 3 * 5 * 5];
 
-__global__ void conv_im2col_block_gpu_kernel(float* Q,
-												float* K,
-												float* V,
-												float* O,
-												int N,
-												int d,
-												int Br,
-												int Bc)
-{
+__global__ void conv_im2col_gpu_kernel(
+					float *input,      // input image: [batch_size][in_channels][height][width]
+					float *bias,       // bias： [out_channels] (可为NULL)
+					float *output,     // output: [batch_size][out_channels][out_h][out_w]
+					int batch_size,    // batch
+					int in_channels,   // input channel: RGB
+					int out_channels,  // output channel: num of kernels
+					int height,        // image height
+					int width,         // image width
+					int kernel_h,      // kernel height
+					int kernel_w,      // kernel width
+					int stride_h,      // stride height
+					int stride_w,      // stride width
+					int padding_h,     // padding height
+					int padding_w      // padding width)
+) {
 	int i, j, k;
-	int iRow, jCol, id;
-
+	
 	// inside a block
-	int xIdx = threadIdx.x;
-	int yIdx = threadIdx.y;
+	int tid_x = threadIdx.x;
 	// block shape
 	int xLen = blockDim.x;
 	int yLen = blockDim.y;
 	// block index
-	int Block_X_Idx = blockIdx.x;
-	int Block_Y_Idx = blockIdx.y; // 0
+	int bx = blockIdx.x;
+	int by = blockIdx.y; // batch index
 	
-	int tid_x = yIdx * xLen + xIdx;
+	extern __shared__ float sram[];
 
+	// shared memory
+	float *sInImgCh0 = sram; // shared memory of input imag: width * kernel_h
+	float *sInImgCh1 = sInImgCh0 + width * kernel_h; // shared memory of input imag: width * kernel_h
+	float *sInImgCh2 = sInImgCh1 + width * kernel_h; // shared memory of input imag: width * kernel_h
+	float *sCvtColMatrix = sInImgCh2 + width * kernel_h; // shared memory of input imag: 128 * in_channels * kernel_h * kernel_w
+
+	// step 1: load img from global to shared
+	int start_row = bx - padding_h;
+	int s_start_row = (start_row >= 0) ? 0 : (-start_row);
+	int g_start_row = (start_row >= 0) ? start_row : 0;
+
+	int num_row = (start_row >= 0) ? kernel_h : (kernel_h + start_row);
+	
+	int num_row_tail = (height - kernel_h) - start_row;
+	num_row = (num_row_tail > 0) ? num_row : (kernel_h + num_row_tail);
+
+	// if (tid_x == 0)
+	//	printf("bx: %d, num_row: %d, s_start_row: %d \n", bx, num_row, s_start_row);
+
+	// input size per batch
+ 	int numPixelperChannel = height * width; // input image
+	int numPixelperBatch = numPixelperChannel * in_channels;
+
+	float *gInImg = input + by * numPixelperBatch;
+	float *gInImgCh0 = gInImg;
+	float *gInImgCh1 = gInImgCh0 + numPixelperChannel;
+	float *gInImgCh2 = gInImgCh1 + numPixelperChannel;
+
+	// set to 0, 5 * 128 is less than 1024
+	if (tid_x < width * kernel_h){
+		sInImgCh0[tid_x]  = 0.0f;
+		sInImgCh1[tid_x]  = 0.0f;
+		sInImgCh2[tid_x]  = 0.0f;
+	}
+
+	if (tid_x < width * num_row){
+		sInImgCh0[width * s_start_row + tid_x]  = gInImgCh0[g_start_row * width + tid_x];
+		sInImgCh1[width * s_start_row + tid_x]  = gInImgCh1[g_start_row * width + tid_x];
+		sInImgCh2[width * s_start_row + tid_x]  = gInImgCh2[g_start_row * width + tid_x];
+	}
+	
+	__syncthreads();
+
+	
+	// step 2: im2col - need to be optimized
+    int out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
+    int out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
+ 
+	int col_rows = in_channels * kernel_h * kernel_w;
+	int col_cols = out_w;
+
+	int numElePerOutKernel = out_h * out_w;
+	int numElePerOutBatch = out_channels * numElePerOutKernel; // output
+
+	float conv_5x5[5*5] = {0.0f};
+	float *startImg;
+	float *tempCvtColMatrix;
+	
+	if (tid_x < 384)
+	{
+		startImg = sInImgCh2;
+		tempCvtColMatrix = sCvtColMatrix + 2 * kernel_h * kernel_w * col_cols;
+	}
+	
+	if (tid_x < 256)
+	{
+		startImg = sInImgCh1;
+		tempCvtColMatrix = sCvtColMatrix + kernel_h * kernel_w * col_cols;
+	}
+	
+	if (tid_x < 128){
+		startImg = sInImgCh0;
+		tempCvtColMatrix = sCvtColMatrix;
+	}
+	
+	if (tid_x < 384){
+		int tid_rem = tid_x % 128;
+		int start_conv = tid_rem - padding_w;
+		
+		int s_start_col = (start_conv >= 0) ? 0 : (-start_conv);
+		int s_end_col = (start_conv > (width - kernel_w)) ? (width - start_conv) : 5;
+
+		//if (tid_x < 128 && bx == 0){
+			//printf("tid_x: %d, s_start_col: %d, s_end_col: %d \n", tid_x, s_start_col, s_end_col);
+		//}
+		
+		int s_start_col_img = (start_conv >= 0) ? start_conv : 0;
+
+		for (int conv_i = 0; conv_i < 5; conv_i ++)
+		{
+			for (int conv_j = s_start_col; conv_j < s_end_col; conv_j ++)
+			{
+				conv_5x5[conv_i * 5 + conv_j] = startImg[ conv_i * 128 + s_start_col_img + conv_j - s_start_col ];
+			}
+		}
+		
+		// write into converted col matrix
+		for (int conv_i = 0; conv_i < 25; conv_i++)
+		{
+			tempCvtColMatrix[conv_i * col_cols + tid_rem] = conv_5x5[conv_i];
+		}
+	}
+
+	__syncthreads();
+
+/*
+		if (tid_x == 0 && bx == 0 && by == 0)
+		{
+			for (int conv_i = 0; conv_i < 25; conv_i++)
+				printf("conv_i: %d val: %f \n", conv_i, conv_5x5[conv_i]);
+		}
+
+	__syncthreads();
+*/
+#if 1
+	// step 3: matmul, each thread calculate 2x2 = 4 elements
+	int rowIdx = tid_x / 64;
+	int colIdx = tid_x % 64;
+	int iRow, iCol;
+	
+	float res[2][2];
+	rowIdx *= 2;
+	colIdx *= 2;
+	
+	for (iRow = rowIdx; iRow < (rowIdx + 2); iRow++){
+		for (iCol = colIdx; iCol < (colIdx + 2); iCol++){
+
+			float bias_val = bias ? bias[iRow] : 0.0f;
+        
+			float sum = 0.0f;
+
+			// convolution
+			for (int kIdx = 0; kIdx < col_rows; kIdx++) {				
+				sum += sCvtColMatrix[kIdx * col_cols + iCol] * d_kernel_const[iRow * col_rows + kIdx];
+			}
+			
+			// bias
+			sum += bias_val;
+			
+			res[iRow - rowIdx][iCol - colIdx] = sum;
+			
+		}
+	}
+
+	__syncthreads();
+	
+	
+	float *output_block = output + by * numElePerOutBatch + rowIdx * numElePerOutKernel + bx * out_h + colIdx;
+	*(output_block) = res[0][0];
+	*(output_block + 1) = res[0][1];
+
+	float *output_block1 = output + by * numElePerOutBatch + (rowIdx + 1) * numElePerOutKernel + bx * out_h + colIdx;
+	*(output_block1) = res[1][0];
+	*(output_block1 + 1) = res[1][1];
+#endif
 
 	return;
 }
@@ -470,7 +678,7 @@ int main(int argc, char **argv)
 {
     printf("> %s Starting...\n", argv[0]);
 	
-    // GPT-2 parameters
+    // conv parameters
     const int nBatch = 32; // number of batchs
 	const int imgHeight = 128; // image height
 	const int imgWidth = 128; // image width
@@ -481,7 +689,7 @@ int main(int argc, char **argv)
 	const int padding_h = 2; // padding in height direction
 	const int padding_w = 2; // paddign in width direction
 	const int inChannel = 3; // 3 channels per image
-	const int outChannel = 2; // 2 kernels debug
+	const int outChannel = 32; // 32 kernels
 
     float *inImg;
 	float *inImgCol;
@@ -497,12 +705,12 @@ int main(int argc, char **argv)
 	int inImgColSize = nBatch * out_height * out_width * inChannel * kernelHeight * kernelWidth;
 	
 	int imgSize = nBatch * inChannel * imgHeight * imgHeight; // 1.5MB
-	int kernelSize = outChannel * kernelHeight * kernelWidth; // 50B
+	const int kernelSize = outChannel * inChannel * kernelHeight * kernelWidth;
 	// keep same size with input
 	int oSize = nBatch * outChannel * out_height * out_width; // 1MB
 
 	printf("img size: %d kernel size: %d converted col matrix: %d out size: %d \n", imgSize, kernelSize, inImgColSize, oSize);
-		
+
 	Mimo64_alloc_host_mem((void **)&inImg, imgSize * sizeof(float)); // 6MB
 	Mimo64_alloc_host_mem((void **)&kernel, kernelSize * sizeof(float));
 	Mimo64_alloc_host_mem((void **)&bias, outChannel * sizeof(float));
@@ -529,6 +737,7 @@ int main(int argc, char **argv)
  	initialData_f32(kernel, kernelSize);
  	initialData_f32(bias, outChannel);
 	
+
 	//bias = NULL;
 #if 1
 	long t_start = useconds();
@@ -585,6 +794,73 @@ int main(int argc, char **argv)
 	checkResult(O_base, O, oSize);
 #endif
 
+#if 1
+	float kernel_time;
+    cudaEvent_t start, stop;
+    CHECK(cudaEventCreate(&start));
+    CHECK(cudaEventCreate(&stop));
+
+
+	CHECK(cudaMemcpy(d_inImg, inImg, imgSize * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpyToSymbol(d_kernel_const, kernel, kernelSize * sizeof(float), 0, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_bias, bias, outChannel * sizeof(float), cudaMemcpyHostToDevice));
+    
+	const int numColPerBlk = 128;
+	int colBlkSize = numColPerBlk * inChannel * kernelHeight * kernelWidth;
+	int inputBlkSize = numColPerBlk * kernelHeight * inChannel;
+
+	// Calculate SRAM size needed per block
+    const int sram_size = (colBlkSize * sizeof(float)) /* col matrix block size*/
+						+ (inputBlkSize * sizeof(float)) /* input image */;
+						
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+	
+	int skipKernel = 0;
+
+	if (max_sram_size < sram_size){
+		skipKernel = 1;
+		printf("Your request memory is larger than system volume, please input another Br/Bc combination! \n");
+	}
+	int block_x = 1024;
+	int block_y = 1;
+	int gridIdx_x = (out_height * out_width) / numColPerBlk;
+	//printf("gridIdx_x: %d \n", gridIdx_x);
+	
+	if (skipKernel == 0){
+		dim3 grid(gridIdx_x, nBatch);
+		dim3 block(block_x, block_y);
+
+		CHECK(cudaEventRecord(start, 0));
+
+		conv_im2col_gpu_kernel<<<grid, block, sram_size>>>(	d_inImg,
+															d_bias,
+															d_O,
+															nBatch,
+															inChannel,
+															outChannel,
+															imgHeight,
+															imgWidth,
+															kernelHeight,
+															kernelWidth,
+															stride_h,
+															stride_w,
+															padding_h,
+															padding_w);
+
+		CHECK(cudaEventRecord(stop, 0));
+		CHECK(cudaEventSynchronize(stop));
+		CHECK(cudaEventElapsedTime(&kernel_time, start, stop));
+
+		CHECK(cudaMemcpy(O, d_O, oSize * sizeof(float), cudaMemcpyDeviceToHost));
+
+		printf("conv_im2col_block_gpu_kernel() costs %ld us \n", (long)(kernel_time * 1000.0f));
+
+		checkResult(O_base, O, oSize);	
+	}
+	
+#endif
 
 
 

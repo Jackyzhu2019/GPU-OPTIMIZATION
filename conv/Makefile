@@ -6,7 +6,7 @@ OBJS := $(SRCS:.cu=.o)
 timestamp := $(shell date +"%Y%m%d_%H%M%S")
 output_file := report_$(timestamp)
 CUDA_PROF ?= 0
-FLASH_ATT_OPT ?= 1
+#FLASH_ATT_OPT ?= 1
 
 ifeq ($(FLASH_ATT_OPT),1)
 CFLAGS += -DFLASH_ATT_OPT=1
